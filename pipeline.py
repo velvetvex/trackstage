@@ -523,7 +523,12 @@ def read_audio_info(fp: Path) -> dict:
 # ── Rekordbox XML helpers ─────────────────────────────────────────────────────
 
 def to_rb_location(path: Path) -> str:
-    posix   = path.as_posix()
+    posix = path.as_posix()
+    # Convert WSL /mnt/X/ paths to Windows X:/ for Rekordbox compatibility
+    import re as _re
+    m = _re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
+    if m:
+        posix = f"{m.group(1).upper()}:/{m.group(2)}"
     encoded = quote(posix, safe="/:@!$&'()*+,;=-._~")
     if not encoded.startswith("/"):
         encoded = "/" + encoded
