@@ -1165,6 +1165,112 @@ def process_release_folder(folder, client, library, threshold, dry_run,
     return results_out
 
 
+# ── Rebuild playlists from existing XML ───────────────────────────────────────
+
+def rebuild_playlists(xml_path: Path, as_json: bool = False):
+    """
+    Parse all existing tracks in COLLECTION and build Styles/, Labels/,
+    and Recent playlists from their metadata fields.
+
+    Styles are extracted from Comments (e.g. "Techno, Acid | Cat# XYZ").
+    Labels are read from the Label attribute.
+    """
+    tree, root, _ = load_or_bootstrap_xml(xml_path)
+    collection = root.find("COLLECTION")
+    if collection is None:
+        if as_json:
+            print(json.dumps({"error": "No COLLECTION in XML"}))
+        else:
+            print("  No COLLECTION found in XML.")
+        return
+
+    tracks = collection.findall("TRACK")
+    if not tracks:
+        if as_json:
+            print(json.dumps({"error": "No tracks in XML"}))
+        else:
+            print("  No tracks in XML.")
+        return
+
+    # Wipe existing auto-playlists to rebuild clean
+    playlists_node = root.find("PLAYLISTS")
+    if playlists_node is None:
+        playlists_node = ET.SubElement(root, "PLAYLISTS")
+
+    root_node = playlists_node.find("NODE[@Name='ROOT']")
+    if root_node is None:
+        root_node = ET.SubElement(playlists_node, "NODE",
+                                  Type="0", Name="ROOT", Count="0")
+
+    for name in ("Styles", "Labels"):
+        for child in list(root_node):
+            if child.get("Type") == "0" and child.get("Name") == name:
+                root_node.remove(child)
+
+    for child in list(root_node):
+        if child.get("Type") == "1" and child.get("Name") == "Recent":
+            root_node.remove(child)
+
+    styles_folder = _find_or_create_folder(root_node, "Styles")
+    labels_folder = _find_or_create_folder(root_node, "Labels")
+    recent_pl = _find_or_create_playlist(root_node, "Recent")
+
+    style_counts = {}
+    label_counts = {}
+
+    for track in tracks:
+        tid = track.get("TrackID", "")
+        label = track.get("Label", "").strip()
+        comments = track.get("Comments", "").strip()
+
+        # Parse styles from Comments: "Techno, Acid | Cat# XYZ" → ["Techno", "Acid"]
+        styles_str = comments.split(" | ")[0] if comments else ""
+        if styles_str.startswith("Cat#"):
+            styles_str = ""
+
+        for style in styles_str.split(", "):
+            style = style.strip()
+            if style:
+                pl = _find_or_create_playlist(styles_folder, style)
+                _add_track_to_playlist(pl, tid)
+                style_counts[style] = style_counts.get(style, 0) + 1
+
+        if label:
+            pl = _find_or_create_playlist(labels_folder, label)
+            _add_track_to_playlist(pl, tid)
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+        _add_track_to_playlist(recent_pl, tid)
+
+    _trim_playlist(recent_pl, RECENT_PLAYLIST_CAP)
+    _update_folder_counts(root_node)
+    _save_xml(tree, xml_path)
+
+    if as_json:
+        print(json.dumps({
+            "tracks": len(tracks),
+            "style_playlists": len(style_counts),
+            "label_playlists": len(label_counts),
+            "top_styles": sorted(style_counts.items(), key=lambda x: -x[1])[:15],
+            "top_labels": sorted(label_counts.items(), key=lambda x: -x[1])[:15],
+        }, indent=2))
+    else:
+        print(f"\n{'═' * 64}")
+        print(f"  Playlist Rebuild — {len(tracks)} tracks")
+        print(f"{'═' * 64}")
+        print(f"  Style playlists:  {len(style_counts)}")
+        print(f"  Label playlists:  {len(label_counts)}")
+        print(f"  Recent playlist:  {min(len(tracks), RECENT_PLAYLIST_CAP)} tracks")
+        print(f"\n  Top styles:")
+        for s, c in sorted(style_counts.items(), key=lambda x: -x[1])[:15]:
+            print(f"    {c:4d}  {s}")
+        print(f"\n  Top labels:")
+        for l, c in sorted(label_counts.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {c:4d}  {l}")
+        print(f"\n{'═' * 64}")
+        print(f"  XML saved → {xml_path}\n")
+
+
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
 def run_pipeline(
@@ -1358,6 +1464,8 @@ def main():
     )
     p.add_argument("--list", action="store_true",
                    help="List inbox contents and exit")
+    p.add_argument("--rebuild-playlists", action="store_true",
+                   help="Rebuild all playlists from existing XML tracks and exit")
     p.add_argument("--target", type=Path, default=None,
                    help="Process only this file or folder (relative to inbox)")
     p.add_argument("--discogs-id", type=int, default=None,
@@ -1400,6 +1508,10 @@ def main():
 
     if args.list:
         list_inbox(args.inbox, args.json)
+        return
+
+    if args.rebuild_playlists:
+        rebuild_playlists(args.xml, args.json)
         return
 
     token = os.environ.get("DISCOGS_TOKEN", "").strip()
