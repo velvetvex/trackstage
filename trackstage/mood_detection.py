@@ -1,8 +1,9 @@
 """
 mood_detection.py — ML-based mood/vibe tagging and vocal detection.
 
-Uses Essentia TensorFlow models (discogs-effnet embeddings + classification heads).
-Returns: mood tags (aggressive, happy, relaxed, sad, party), vocal/instrumental flag.
+Uses Essentia mel spectrograms + TensorFlow frozen graphs (discogs-effnet
+embeddings + classification heads). Does NOT require essentia-tensorflow's
+TensorflowPredict* algorithms — runs inference via raw tf.compat.v1.Session.
 """
 
 import json
@@ -35,40 +36,7 @@ VIBE_MAP = {
     "party": "driving",
 }
 
-# Vibes that only apply when energy is high enough
 ENERGY_GATED_VIBES = {"driving": 5}
-
-_embedding_model = None
-_classifier_cache = {}
-
-
-def _get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        from essentia.standard import TensorflowPredictEffnetDiscogs
-        _embedding_model = TensorflowPredictEffnetDiscogs(
-            graphFilename=str(MODELS_DIR / "discogs-effnet-bs64-1.pb"),
-            output="PartitionedCall:1",
-        )
-    return _embedding_model
-
-
-def _get_classifier(name):
-    if name not in _classifier_cache:
-        from essentia.standard import TensorflowPredict2D
-        pb = MODELS_DIR / f"{name}-discogs-effnet-1.pb"
-        js = MODELS_DIR / f"{name}-discogs-effnet-1.json"
-        if not pb.exists() or not js.exists():
-            return None, None
-        with open(js) as f:
-            meta = json.load(f)
-        model = TensorflowPredict2D(
-            graphFilename=str(pb),
-            output="model/Softmax",
-        )
-        _classifier_cache[name] = (model, meta["classes"])
-    return _classifier_cache[name]
-
 
 CLASSIFIER_THRESHOLDS = {
     "mood_aggressive": 0.55,
@@ -78,12 +46,102 @@ CLASSIFIER_THRESHOLDS = {
     "mood_party": 0.70,
 }
 
+_embedding_session = None
+_embedding_graph = None
+_classifier_cache = {}
+
+
+def _compute_mel_patches(audio: np.ndarray) -> np.ndarray:
+    from essentia.standard import Windowing, Spectrum, MelBands
+
+    windowing = Windowing(type='hann', size=512, zeroPadding=0)
+    spectrum = Spectrum(size=512)
+    melbands = MelBands(
+        numberBands=96, sampleRate=16000,
+        lowFrequencyBound=0, highFrequencyBound=8000,
+    )
+
+    hop = 256
+    frames = []
+    for i in range(0, len(audio) - 512, hop):
+        w = windowing(audio[i:i + 512])
+        s = spectrum(w)
+        m = melbands(s)
+        frames.append(m)
+
+    mel_spec = np.log1p(np.array(frames, dtype=np.float32) * 10000)
+
+    patch_size = 128
+    n_patches = mel_spec.shape[0] // patch_size
+    if n_patches == 0:
+        return np.empty((0, 128, 96), dtype=np.float32)
+
+    patches = np.array([
+        mel_spec[i * patch_size:(i + 1) * patch_size]
+        for i in range(n_patches)
+    ], dtype=np.float32)
+    return patches
+
+
+def _get_embedding_session():
+    global _embedding_session, _embedding_graph
+    if _embedding_session is None:
+        import tensorflow as tf
+        _embedding_graph = tf.Graph()
+        with _embedding_graph.as_default():
+            graph_def = tf.compat.v1.GraphDef()
+            pb_path = MODELS_DIR / "discogs-effnet-bs64-1.pb"
+            with open(pb_path, 'rb') as f:
+                graph_def.ParseFromString(f.read())
+            tf.import_graph_def(graph_def, name='')
+        _embedding_session = tf.compat.v1.Session(graph=_embedding_graph)
+    return _embedding_session, _embedding_graph
+
+
+def _compute_embeddings(patches: np.ndarray) -> np.ndarray:
+    sess, graph = _get_embedding_session()
+    input_t = graph.get_tensor_by_name('serving_default_melspectrogram:0')
+    output_t = graph.get_tensor_by_name('PartitionedCall:1')
+
+    batch_size = 64
+    all_embeddings = []
+    for i in range(0, len(patches), batch_size):
+        batch = patches[i:i + batch_size]
+        real_count = len(batch)
+        if real_count < batch_size:
+            pad = np.zeros((batch_size - real_count, 128, 96), dtype=np.float32)
+            batch = np.concatenate([batch, pad], axis=0)
+        emb = sess.run(output_t, feed_dict={input_t: batch})
+        all_embeddings.append(emb[:real_count])
+
+    return np.concatenate(all_embeddings, axis=0)
+
+
+def _get_classifier(name: str):
+    if name not in _classifier_cache:
+        import tensorflow as tf
+        pb = MODELS_DIR / f"{name}-discogs-effnet-1.pb"
+        js = MODELS_DIR / f"{name}-discogs-effnet-1.json"
+        if not pb.exists() or not js.exists():
+            _classifier_cache[name] = (None, None, None)
+            return _classifier_cache[name]
+
+        with open(js) as f:
+            meta = json.load(f)
+
+        graph = tf.Graph()
+        with graph.as_default():
+            graph_def = tf.compat.v1.GraphDef()
+            with open(pb, 'rb') as f2:
+                graph_def.ParseFromString(f2.read())
+            tf.import_graph_def(graph_def, name='')
+        sess = tf.compat.v1.Session(graph=graph)
+        _classifier_cache[name] = (sess, graph, meta["classes"])
+
+    return _classifier_cache[name]
+
 
 def detect_mood(file_path: Path, confidence_threshold: float = 0.55, energy: int = 5) -> dict:
-    """Classify mood and vocal/instrumental for a track.
-
-    energy: track energy (1-10) from audio_analysis, used to gate certain vibes.
-    """
     result = {
         "moods": [],
         "vibes": [],
@@ -98,19 +156,25 @@ def detect_mood(file_path: Path, confidence_threshold: float = 0.55, energy: int
         return result
 
     try:
-        embeddings = _get_embedding_model()(audio)
+        patches = _compute_mel_patches(audio)
+        if len(patches) == 0:
+            log.warning("  ⚠  Track too short for mood detection")
+            return result
+        embeddings = _compute_embeddings(patches)
     except Exception as e:
         log.warning(f"  ⚠  Embedding extraction failed: {e}")
         return result
 
     for clf_name in CLASSIFIERS:
-        clf = _get_classifier(clf_name)
-        if clf[0] is None:
+        sess, graph, classes = _get_classifier(clf_name)
+        if sess is None:
             continue
-        model, classes = clf
 
         try:
-            preds = model(embeddings)
+            preds = sess.run(
+                graph.get_tensor_by_name('model/Softmax:0'),
+                feed_dict={graph.get_tensor_by_name('model/Placeholder:0'): embeddings},
+            )
             avg = np.mean(preds, axis=0)
             top_idx = np.argmax(avg)
             top_class = classes[top_idx]
@@ -125,7 +189,6 @@ def detect_mood(file_path: Path, confidence_threshold: float = 0.55, energy: int
                 if "not_" not in top_class and "non_" not in top_class:
                     mood = top_class
                     vibe = VIBE_MAP.get(mood, mood)
-                    # Gate vibes that need minimum energy
                     min_energy = ENERGY_GATED_VIBES.get(vibe)
                     if min_energy and energy < min_energy:
                         continue
