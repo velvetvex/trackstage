@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-pipeline.py — DJ Library Pipeline
+pipeline.py — trackstage core pipeline
 
-Scan inbox → Discogs lookup → tag → rename → move to Library → update Rekordbox
-XML with collection entries and auto-playlists (by Style, Label, and Recent).
+Scan inbox → Discogs lookup → audio analysis → tag → rename → move to Library →
+update Rekordbox XML with collection entries and auto-playlists.
 
 Usage:
-    python3 pipeline.py --list                          # show inbox contents
-    python3 pipeline.py --list --json                   # JSON inventory
-    python3 pipeline.py --target "Artist - EP" -y       # process one item
-    python3 pipeline.py -y                              # process everything
-    python3 pipeline.py --target "track.flac" -y --discogs-id 12345
-    python3 pipeline.py --target "track.flac" -y --playlist "Summer 2026"
-    python3 pipeline.py --dry-run -y                    # preview without changes
+    trackstage --list                              # show inbox contents
+    trackstage --target "Artist - EP" -y           # process one item
+    trackstage -y                                  # process everything
+    trackstage --target "track.flac" -y --discogs-id 12345
+    trackstage --dry-run -y                        # preview without changes
 
 Config (.env in same folder as this script):
     DISCOGS_TOKEN=yourtoken
@@ -42,7 +40,7 @@ import requests
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
+    load_dotenv(Path(__file__).parent.parent / ".env")
 except ImportError:
     pass
 
@@ -50,7 +48,7 @@ try:
     from mutagen.mp3 import MP3
     from mutagen.id3 import (
         ID3, ID3NoHeaderError,
-        TCON, TPUB, TDRC, TYER, TALB, COMM, TXXX, TIT2, TPE1,
+        TCON, TPUB, TDRC, TYER, TALB, COMM, TXXX, TIT2, TPE1, TKEY, TBPM,
     )
     from mutagen.flac import FLAC
     from mutagen.aiff import AIFF
@@ -64,6 +62,30 @@ try:
     _FUZZY = True
 except ImportError:
     _FUZZY = False
+
+try:
+    from .audio_analysis import analyze as analyze_audio, format_analysis_log
+    _ANALYSIS = True
+except ImportError:
+    _ANALYSIS = False
+
+try:
+    from .cue_detection import detect_cues, format_cues_log, CUE_COLORS
+    _CUE_DETECTION = True
+except ImportError:
+    _CUE_DETECTION = False
+
+try:
+    from .mood_detection import detect_mood, format_mood_log
+    _MOOD_DETECTION = True
+except ImportError:
+    _MOOD_DETECTION = False
+
+try:
+    from .loudness import measure_loudness, write_replaygain_tags, format_loudness_log
+    _LOUDNESS = True
+except ImportError:
+    _LOUDNESS = False
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -382,6 +404,10 @@ def _build_comment(meta: dict) -> str:
     parts = [p for p in [
         meta.get("styles", ""),
         f"Cat# {meta['catno']}" if meta.get("catno") else "",
+        f"Energy: {meta['energy']}/10" if meta.get("energy") else "",
+        f"Dance: {meta['danceability']}/10" if meta.get("danceability") else "",
+        meta.get("vibes", ""),
+        meta.get("vocal", ""),
     ] if p]
     return " | ".join(parts)
 
@@ -402,6 +428,14 @@ def write_mp3(fp: Path, meta: dict, dry_run: bool) -> bool:
             tags["TXXX:CATALOGNUMBER"] = TXXX(
                 encoding=3, desc="CATALOGNUMBER", text=meta["catno"]
             )
+        if meta.get("initial_key"):
+            tags["TKEY"] = TKEY(encoding=3, text=meta["initial_key"])
+        if meta.get("bpm"):
+            tags["TBPM"] = TBPM(encoding=3, text=meta["bpm"])
+        if meta.get("energy"):
+            tags["TXXX:ENERGY"] = TXXX(encoding=3, desc="ENERGY", text=meta["energy"])
+        if meta.get("danceability"):
+            tags["TXXX:DANCEABILITY"] = TXXX(encoding=3, desc="DANCEABILITY", text=meta["danceability"])
         c = _build_comment(meta)
         if c:
             tags["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=c)
@@ -426,6 +460,10 @@ def write_flac(fp: Path, meta: dict, dry_run: bool) -> bool:
         if meta.get("year"):
             a["date"] = [meta["year"]]
             a["year"] = [meta["year"]]
+        if meta.get("initial_key"):  a["initialkey"] = [meta["initial_key"]]
+        if meta.get("bpm"):          a["bpm"]        = [meta["bpm"]]
+        if meta.get("energy"):       a["energy"]     = [meta["energy"]]
+        if meta.get("danceability"): a["danceability"] = [meta["danceability"]]
         c = _build_comment(meta)
         if c:
             a["comment"] = [c]
@@ -450,6 +488,14 @@ def write_aiff(fp: Path, meta: dict, dry_run: bool) -> bool:
             a.tags["TXXX:CATALOGNUMBER"] = TXXX(
                 encoding=3, desc="CATALOGNUMBER", text=meta["catno"]
             )
+        if meta.get("initial_key"):
+            a.tags["TKEY"] = TKEY(encoding=3, text=meta["initial_key"])
+        if meta.get("bpm"):
+            a.tags["TBPM"] = TBPM(encoding=3, text=meta["bpm"])
+        if meta.get("energy"):
+            a.tags["TXXX:ENERGY"] = TXXX(encoding=3, desc="ENERGY", text=meta["energy"])
+        if meta.get("danceability"):
+            a.tags["TXXX:DANCEABILITY"] = TXXX(encoding=3, desc="DANCEABILITY", text=meta["danceability"])
         c = _build_comment(meta)
         if c:
             a.tags["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=c)
@@ -473,6 +519,14 @@ def write_m4a(fp: Path, meta: dict, dry_run: bool) -> bool:
             a["----:com.apple.iTunes:CATALOGNUMBER"] = [meta["catno"].encode("utf-8")]
         if meta.get("styles"):
             a["----:com.apple.iTunes:STYLE"] = [meta["styles"].encode("utf-8")]
+        if meta.get("initial_key"):
+            a["----:com.apple.iTunes:INITIALKEY"] = [meta["initial_key"].encode("utf-8")]
+        if meta.get("bpm"):
+            a["tmpo"] = [int(float(meta["bpm"]))]
+        if meta.get("energy"):
+            a["----:com.apple.iTunes:ENERGY"] = [meta["energy"].encode("utf-8")]
+        if meta.get("danceability"):
+            a["----:com.apple.iTunes:DANCEABILITY"] = [meta["danceability"].encode("utf-8")]
         c = _build_comment(meta)
         if c:
             a["\xa9cmt"] = [c]
@@ -717,7 +771,7 @@ def append_tracks_to_xml(
             "Artist":      artist,
             "Composer":    "",
             "Album":       sanitize_xml(meta.get("album", "")),
-            "Grouping":    "",
+            "Grouping":    sanitize_xml(meta.get("vibes", "")),
             "Genre":       sanitize_xml(meta.get("genre", "")),
             "Kind":        KIND_MAP.get(fp.suffix.lower(), "Unknown"),
             "Size":        str(fp.stat().st_size) if fp.exists() else "0",
@@ -725,7 +779,7 @@ def append_tracks_to_xml(
             "DiscNumber":  "0",
             "TrackNumber": "0",
             "Year":        sanitize_xml(meta.get("year", "")),
-            "AverageBpm":  "0.00",
+            "AverageBpm":  meta.get("bpm", "0.00"),
             "DateAdded":   str(date.today()),
             "BitRate":     ainfo["bitrate"],
             "SampleRate":  ainfo["samplerate"],
@@ -734,13 +788,23 @@ def append_tracks_to_xml(
             "Rating":      "0",
             "Location":    loc,
             "Remixer":     "",
-            "Tonality":    "",
+            "Tonality":    sanitize_xml(meta.get("initial_key", "")),
             "Label":       sanitize_xml(meta.get("label", "")),
             "Mix":         "",
         }
 
         if not dry_run:
-            ET.SubElement(collection, "TRACK", **attrs)
+            track_el = ET.SubElement(collection, "TRACK", **attrs)
+            for cue in meta.get("_cues", []):
+                cue_colors = CUE_COLORS.get(cue["type"], {}) if _CUE_DETECTION else {}
+                cue_attrs = {
+                    "Name": cue["name"],
+                    "Type": "0",
+                    "Start": str(cue["time"]),
+                    "Num": "-1",
+                }
+                cue_attrs.update(cue_colors)
+                ET.SubElement(track_el, "POSITION_MARK", **cue_attrs)
         added.append({"track_id": str(max_id), "meta": meta,
                        "artist": artist, "title": title})
         existing_locs.add(loc)
@@ -904,6 +968,7 @@ def fallback_prompt(fp, artist, title, results, scores, client, library,
                 continue
             meta = extract_meta(release)
             _print_meta(meta)
+            _run_analysis(fp, meta, dry_run)
             write_tags(fp, meta, dry_run)
             return _move_file(fp, artist, title, meta, library, dry_run)
 
@@ -916,6 +981,7 @@ def fallback_prompt(fp, artist, title, results, scores, client, library,
                 continue
             meta = extract_meta(release)
             _print_meta(meta)
+            _run_analysis(fp, meta, dry_run)
             write_tags(fp, meta, dry_run)
             return _move_file(fp, artist, title, meta, library, dry_run)
 
@@ -926,11 +992,13 @@ def fallback_prompt(fp, artist, title, results, scores, client, library,
                 continue
             meta, artist_out, title_out = parsed
             _print_meta(meta)
+            _run_analysis(fp, meta, dry_run)
             write_tags(fp, meta, dry_run)
             return _move_file(fp, artist_out, title_out, meta, library, dry_run)
 
         if choice == "m":
             meta, artist_out, title_out = _collect_manual_metadata(artist, title)
+            _run_analysis(fp, meta, dry_run)
             write_tags(fp, meta, dry_run)
             return _move_file(fp, artist_out, title_out, meta, library, dry_run)
 
@@ -993,6 +1061,47 @@ def _move_file(fp, artist, title, meta, library, dry_run):
     }
 
 
+def _run_analysis(fp: Path, meta: dict, dry_run: bool) -> dict:
+    if dry_run:
+        return meta
+    if _ANALYSIS:
+        log.info(f"  Analyzing audio…")
+        existing_key = meta.get("initial_key", "")
+        analysis = analyze_audio(fp, existing_key=existing_key)
+        log.info(f"  {format_analysis_log(analysis)}")
+        if analysis["bpm"]:
+            meta["bpm"] = analysis["bpm"]
+        if analysis["camelot"]:
+            meta["initial_key"] = analysis["camelot"]
+        if analysis["energy"]:
+            meta["energy"] = analysis["energy"]
+        if analysis["danceability"]:
+            meta["danceability"] = analysis["danceability"]
+    if _CUE_DETECTION:
+        log.info(f"  Detecting cue points…")
+        cues = detect_cues(fp)
+        if cues:
+            log.info(f"  {format_cues_log(cues)}")
+            meta["_cues"] = cues
+    if _MOOD_DETECTION:
+        log.info(f"  Classifying mood…")
+        energy_int = int(meta.get("energy") or "5")
+        mood = detect_mood(fp, energy=energy_int)
+        log.info(f"  {format_mood_log(mood)}")
+        if mood["vibes"]:
+            meta["vibes"] = ", ".join(mood["vibes"])
+        if mood["vocal"]:
+            meta["vocal"] = mood["vocal"]
+    if _LOUDNESS:
+        log.info(f"  Measuring loudness…")
+        loudness = measure_loudness(fp)
+        log.info(f"  {format_loudness_log(loudness)}")
+        if loudness["gain_db"] is not None:
+            write_replaygain_tags(fp, loudness)
+            meta["_loudness"] = loudness
+    return meta
+
+
 def _print_meta(meta: dict):
     log.info(f"  Release: {meta['release_title']}")
     log.info(f"  Genre: {meta['genre'] or '—'}  │  Styles: {meta['styles'] or '—'}")
@@ -1019,6 +1128,7 @@ def process_file(fp, client, library, threshold, dry_run,
         if release:
             meta = extract_meta(release)
             _print_meta(meta)
+            _run_analysis(fp, meta, dry_run)
             write_tags(fp, meta, dry_run)
             return _move_file(fp, artist, title, meta, library, dry_run)
         log.warning(f"  ⚠  Could not fetch Discogs release {discogs_id}")
@@ -1042,6 +1152,7 @@ def process_file(fp, client, library, threshold, dry_run,
                                    library, threshold, dry_run)
         meta = extract_meta(release)
         _print_meta(meta)
+        _run_analysis(fp, meta, dry_run)
         write_tags(fp, meta, dry_run)
         return _move_file(fp, artist, title, meta, library, dry_run)
 
@@ -1072,6 +1183,7 @@ def process_file(fp, client, library, threshold, dry_run,
         log.info(f"  ✓  Auto-approved on pass 2 ({best_score}%).")
         meta = extract_meta(best_release)
         _print_meta(meta)
+        _run_analysis(fp, meta, dry_run)
         write_tags(fp, meta, dry_run)
         return _move_file(fp, artist, title, meta, library, dry_run)
 
@@ -1136,6 +1248,7 @@ def process_release_folder(folder, client, library, threshold, dry_run,
         f_title   = file_tags["title"]  or fp.stem
         file_meta = dict(meta, album=meta["release_title"])
 
+        _run_analysis(fp, file_meta, dry_run)
         write_tags(fp, file_meta, dry_run)
 
         dest_dir, dest_path = build_dest(f_artist, f_title, file_meta,
@@ -1286,7 +1399,7 @@ def run_pipeline(
 
     if not as_json:
         print(f"\n{'═' * 64}")
-        print(f"  DJ Library Pipeline")
+        print(f"  trackstage")
         print(f"{'═' * 64}")
         print(f"  Inbox:     {inbox}")
         print(f"  Library:   {library}")
@@ -1464,7 +1577,7 @@ def main():
     xml_default     = os.environ.get("XML_PATH", "")
 
     p = argparse.ArgumentParser(
-        description="DJ Library Pipeline: Discogs → Tag → Move → Rekordbox XML + Playlists",
+        description="trackstage: Discogs → Tag → Move → Rekordbox XML + Playlists",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--list", action="store_true",

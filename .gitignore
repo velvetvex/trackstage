@@ -1,4 +1,28 @@
+# Environment
 .env
+.venv/
+venv/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ML models (download via scripts/download_models.sh)
+models/*.pb
+models/*.json
+
+# Data
 *.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,86 +1,126 @@
-# DJ Library Pipeline
+# trackstage
 
-Automated DJ music library management: Discogs metadata lookup, audio tagging, file organization, and Rekordbox XML generation with auto-playlists.
+Automated DJ music library management with audio intelligence. Handles the full pipeline from inbox to CDJ: Discogs metadata, audio analysis (key, BPM, energy, mood), automatic cue points, loudness normalization, and Rekordbox XML generation.
 
-## What It Does
+## Features
 
-1. Scans an inbox folder for new music (loose files or release folders)
-2. Looks up each track/release on Discogs with fuzzy matching
-3. Writes metadata tags to audio files (genre, styles, label, catalog number, year)
-4. Renames and moves files to an organized library: `Library/{Year}/{Release [Label CatNo]}/Artist - Title.ext`
-5. Updates a Rekordbox XML file with collection entries and auto-generated playlists
+### Metadata Pipeline
+- Discogs API lookup with fuzzy matching
+- Genre, style, label, catalog number, year tagging
+- Organized file structure: `Library/{Year}/{Release [Label CatNo]}/Artist - Title.ext`
+- Rekordbox XML with collection entries and auto-playlists (by style, label, recent)
 
-### Auto Playlists
+### Audio Analysis
+- **Key detection** — Camelot wheel notation for harmonic mixing
+- **BPM** — Smart half-time correction (handles DnB, jungle, breakbeat)
+- **Energy** (1–10) — Calibrated from library percentiles
+- **Danceability** (1–10) — Blended DFA + onset density
+- **Mood/Vibes** — ML classification (dark, euphoric, deep, melancholic, driving)
+- **Vocal detection** — Instrumental vs. voice
 
-Playlists are created automatically from Discogs metadata:
-- **Styles/** — one playlist per style (Techno, House, Acid, Deep House, etc.)
-- **Labels/** — one playlist per record label
-- **Recent** — last 100 tracks added
-- Custom playlists via `--playlist` flag
+### Cue Points
+- Auto-detected structural markers for Rekordbox
+- Mix In / Mix Out points for seamless transitions
+- Drop and Breakdown detection via energy contour analysis
+- Section markers for flat-energy tracks (loops, acid, etc.)
 
-When exported to USB from Rekordbox, these playlists become browsable folders on CDJs/XDJs.
+### Loudness Normalization
+- EBU R128 integrated loudness measurement
+- ReplayGain tags for consistent playback across eras
+- Non-destructive — audio files are never modified, only metadata
 
 ## Setup
 
 ### Requirements
 
+Python 3.10+
+
 ```bash
-pip install mutagen thefuzz python-Levenshtein requests python-dotenv
+# Core (metadata pipeline)
+pip install -e .
+
+# Full (with audio analysis)
+pip install -e ".[analysis]"
 ```
 
 ### Configuration
 
 ```bash
 cp .env.example .env
-# Edit .env with your Discogs token and folder paths
 ```
 
-Get a Discogs token at: https://www.discogs.com/settings/developers
+Edit `.env` with your [Discogs token](https://www.discogs.com/settings/developers) and folder paths.
 
-### Claude Code Skill (optional)
+### ML Models
 
-Copy the skill directory to enable natural language control:
+Download Essentia TensorFlow models for mood/vibe classification:
 
 ```bash
-cp -r skill/dj-library ~/.claude/skills/
+./scripts/download_models.sh
 ```
-
-Then tell Claude things like "add that new Bicep record to my collection" or "what's in my inbox?"
 
 ## Usage
 
 ```bash
 # List inbox contents
-python3 pipeline.py --list
+trackstage --list
 
-# Process a specific item
-python3 pipeline.py --target "Artist - EP Name" -y
+# Process a specific release
+trackstage --target "Artist - EP Name" -y
 
-# Process everything in the inbox
-python3 pipeline.py -y
+# Process everything
+trackstage -y
+
+# Preview without changes
+trackstage --dry-run -y
+
+# Override Discogs match
+trackstage --target "track.flac" -y --discogs-id 12345
 
 # Add to a custom playlist
-python3 pipeline.py --target "track.flac" -y --playlist "Summer 2026"
+trackstage --target "track.flac" -y --playlist "Summer 2026"
 
-# Override Discogs match with a known release ID
-python3 pipeline.py --target "track.flac" -y --discogs-id 12345
-
-# Preview without making changes
-python3 pipeline.py --dry-run -y
-
-# JSON output (for automation)
-python3 pipeline.py --list --json
-python3 pipeline.py --target "track.flac" -y --json
+# Rebuild playlists from existing XML
+trackstage --rebuild-playlists
 ```
+
+Or run as a module:
+
+```bash
+python -m trackstage --list
+```
+
+## Architecture
+
+```
+trackstage/
+├── pipeline.py          # CLI entry point, Discogs lookup, file management, XML
+├── audio_analysis.py    # Key, BPM, energy, danceability (Essentia)
+├── cue_detection.py     # Structural cue point detection
+├── mood_detection.py    # ML mood/vibe classification (TensorFlow)
+└── loudness.py          # EBU R128 measurement + ReplayGain tags
+```
+
+Analysis modules degrade gracefully — if Essentia isn't installed, the pipeline still runs with Discogs-only metadata.
 
 ## Supported Formats
 
-MP3, FLAC, AIFF, M4A
+MP3, FLAC, AIFF, M4A/AAC
 
-## Rekordbox Import
+## Rekordbox Integration
 
-After processing, import the updated XML in Rekordbox:
+After processing, import the XML in Rekordbox:
 
-1. File → Import → Import rekordbox XML File
-2. Select the XML file path from your `.env`
-3. Rekordbox picks up new tracks and playlists automatically
+1. **Preferences → Advanced → Database → rekordbox xml** — set the XML path
+2. The XML contains track metadata, cue points (with colors), and playlists
+3. Export to USB for CDJ/XDJ use — playlists become browsable folders
+
+### Auto-Generated Playlists
+
+- **Styles/** — One playlist per style (Techno, Acid, Deep House, DnB, etc.)
+- **Labels/** — One playlist per record label
+- **Recent** — Last 100 tracks added
+
+## License
+
+MIT
