@@ -15,6 +15,7 @@ import time
 import argparse
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from pathlib import Path
