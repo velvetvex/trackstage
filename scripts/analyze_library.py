@@ -66,9 +66,10 @@ def _merge_comment(existing: str, energy: str, dance: str, vibes: str, vocal: st
             continue
         if p in ("instrumental", "voice", ""):
             continue
-        # Skip if it matches a known vibe word only
+        # Skip if all comma-separated parts are known vibes (handles "dark, driving")
         vibe_words = {"dark", "euphoric", "deep", "melancholic", "driving"}
-        if p.lower() in vibe_words:
+        sub_parts = [s.strip().lower() for s in p.split(",")]
+        if all(s in vibe_words for s in sub_parts if s):
             continue
         cleaned.append(p)
 
