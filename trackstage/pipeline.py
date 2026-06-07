@@ -87,6 +87,12 @@ try:
 except ImportError:
     _LOUDNESS = False
 
+try:
+    from .analyzer import analyze_track
+    _FAST_ANALYSIS = True
+except ImportError:
+    _FAST_ANALYSIS = False
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1064,9 +1070,48 @@ def _move_file(fp, artist, title, meta, library, dry_run):
 def _run_analysis(fp: Path, meta: dict, dry_run: bool) -> dict:
     if dry_run:
         return meta
+
+    existing_key = meta.get("initial_key", "")
+
+    # Fast path: single-load coordinator (eliminates redundant beat tracking)
+    if _FAST_ANALYSIS:
+        log.info(f"  Analyzing audio…")
+        r = analyze_track(fp, existing_key=existing_key)
+        if r.get("bpm"):
+            meta["bpm"] = r["bpm"]
+        if r.get("camelot"):
+            meta["initial_key"] = r["camelot"]
+        if r.get("energy"):
+            meta["energy"] = r["energy"]
+        if r.get("danceability"):
+            meta["danceability"] = r["danceability"]
+        if r.get("cues"):
+            meta["_cues"] = r["cues"]
+        if r.get("vibes"):
+            meta["vibes"] = ", ".join(r["vibes"])
+        if r.get("vocal"):
+            meta["vocal"] = r["vocal"]
+        if r.get("loudness") and r["loudness"].get("gain_db") is not None:
+            write_replaygain_tags(fp, r["loudness"])
+            meta["_loudness"] = r["loudness"]
+
+        # Log summary
+        from .audio_analysis import format_analysis_log
+        from .cue_detection import format_cues_log
+        from .mood_detection import format_mood_log
+        from .loudness import format_loudness_log
+        log.info(f"  {format_analysis_log(r)}")
+        if r.get("cues"):
+            log.info(f"  {format_cues_log(r['cues'])}")
+        if r.get("vibes") or r.get("vocal"):
+            log.info(f"  {format_mood_log({'moods': r.get('moods', []), 'vibes': r.get('vibes', []), 'vocal': r.get('vocal', '')})}")
+        if r.get("loudness"):
+            log.info(f"  {format_loudness_log(r['loudness'])}")
+        return meta
+
+    # Fallback: individual modules (if analyzer not available)
     if _ANALYSIS:
         log.info(f"  Analyzing audio…")
-        existing_key = meta.get("initial_key", "")
         analysis = analyze_audio(fp, existing_key=existing_key)
         log.info(f"  {format_analysis_log(analysis)}")
         if analysis["bpm"]:
