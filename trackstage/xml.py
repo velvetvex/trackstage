@@ -1,8 +1,8 @@
 """
-xml.py — Rekordbox XML management.
+xml.py — Rekordbox XML management (single source of truth).
 
-Handles: location encoding, XML bootstrap/load/save, collection CRUD,
-playlist management (Styles, Labels, Recent, custom).
+Handles: location encoding, XML bootstrap/load/save, track updates,
+collection CRUD, playlist management (Styles, Labels, Recent, custom).
 """
 
 import re
@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+
+# ── Constants ────────────────────────────────────────────────────────────────
 
 RECENT_PLAYLIST_CAP = 100
 
@@ -23,8 +25,29 @@ KIND_MAP = {
     ".m4a":  "AAC File",
 }
 
+ENERGY_TO_RATING = {
+    "1": "51", "2": "51",
+    "3": "102", "4": "102",
+    "5": "153", "6": "153",
+    "7": "204", "8": "204",
+    "9": "255", "10": "255",
+}
+
+MOOD_PRIORITY = ["aggressive", "sad", "happy", "party", "relaxed"]
+
+MOOD_TO_COLOUR = {
+    "aggressive": "0xFF0000",
+    "happy":      "0xFFA500",
+    "party":      "0xFFFF00",
+    "relaxed":    "0x00FF00",
+    "sad":        "0x8000FF",
+}
+
+
+# ── Location encoding ────────────────────────────────────────────────────────
 
 def to_rb_location(path: Path) -> str:
+    """Convert WSL /mnt/X/... path to file://localhost/X:/... URL for Rekordbox."""
     posix = path.as_posix()
     m = re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
     if m:
@@ -35,11 +58,29 @@ def to_rb_location(path: Path) -> str:
     return f"file://localhost{encoded}"
 
 
+def to_rb_windows_path(path: Path) -> str:
+    """Convert WSL /mnt/X/... path to X:/... (no URL encoding, for DB matching)."""
+    posix = path.as_posix()
+    m = re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
+    if m:
+        return f"{m.group(1).upper()}:/{m.group(2)}"
+    return posix
+
+
+# ── XML sanitization ─────────────────────────────────────────────────────────
+
 def sanitize_xml(s: str) -> str:
+    """Strip control characters that are invalid in XML."""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(s))
 
 
+# ── XML load/save ────────────────────────────────────────────────────────────
+
 def load_or_bootstrap_xml(xml_path: Path) -> tuple:
+    """Load existing Rekordbox XML or create a new DJ_PLAYLISTS structure.
+
+    Returns (tree, root, max_track_id).
+    """
     if not xml_path.exists():
         root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
         ET.SubElement(root, "PRODUCT",
@@ -61,11 +102,99 @@ def load_or_bootstrap_xml(xml_path: Path) -> tuple:
 
 
 def save_xml(tree: ET.ElementTree, xml_path: Path):
+    """Write XML with UTF-8 header and pretty indentation."""
     ET.indent(tree, space="  ")
     xml_path.parent.mkdir(parents=True, exist_ok=True)
     with open(xml_path, "wb") as f:
         f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
         tree.write(f, encoding="utf-8", xml_declaration=False)
+
+
+# ── Track update ─────────────────────────────────────────────────────────────
+
+def _pick_colour(moods: list) -> str:
+    """Select Rekordbox colour based on mood priority."""
+    for mood in MOOD_PRIORITY:
+        if mood in moods:
+            return MOOD_TO_COLOUR[mood]
+    return ""
+
+
+def update_xml_track(track_el: ET.Element, r: dict) -> bool:
+    """Update a TRACK element with all analysis fields from result dict.
+
+    Args:
+        track_el: existing XML TRACK element
+        r: analysis result dict with keys like bpm, camelot, energy,
+           danceability, vibes, moods, vocal, cues
+
+    Returns:
+        True if any field was changed.
+    """
+    from trackstage.tags import merge_comment, build_grouping
+    from trackstage.cue_detection import CUE_COLORS
+
+    changed = False
+
+    # BPM
+    if r.get("bpm"):
+        track_el.set("AverageBpm", r["bpm"])
+        changed = True
+
+    # Key (Camelot notation)
+    if r.get("camelot"):
+        track_el.set("Tonality", r["camelot"])
+        changed = True
+
+    # Grouping (vibes + moods)
+    grouping = build_grouping(r)
+    if grouping:
+        track_el.set("Grouping", sanitize_xml(grouping))
+        changed = True
+
+    # Comments (merge analysis into existing)
+    existing_comment = track_el.get("Comments", "")
+    new_comment = merge_comment(
+        existing_comment,
+        r.get("energy", ""),
+        r.get("danceability", ""),
+        ", ".join(r.get("vibes", [])),
+        r.get("vocal", ""),
+    )
+    if new_comment != existing_comment:
+        track_el.set("Comments", sanitize_xml(new_comment))
+        changed = True
+
+    # Rating (energy mapped to Rekordbox 0-255 scale)
+    if r.get("energy"):
+        rating = ENERGY_TO_RATING.get(r["energy"], "")
+        if rating:
+            track_el.set("Rating", rating)
+            changed = True
+
+    # Colour (primary mood)
+    colour = _pick_colour(r.get("moods", []))
+    if colour:
+        track_el.set("Colour", colour)
+        changed = True
+
+    # Cue points (replace existing POSITION_MARK elements)
+    if r.get("cues"):
+        for old_cue in track_el.findall("POSITION_MARK"):
+            track_el.remove(old_cue)
+        for cue in r["cues"]:
+            cue_colors = CUE_COLORS.get(cue["type"], {})
+            cue_attrs = {
+                "Name": cue["name"],
+                "Type": "0",
+                "Start": str(cue["time"]),
+                "Num": "-1",
+            }
+            cue_attrs.update(cue_colors)
+            ET.SubElement(track_el, "POSITION_MARK", **cue_attrs)
+        changed = True
+
+    return changed
 
 
 # ── Playlist helpers ─────────────────────────────────────────────────────────
@@ -121,6 +250,10 @@ def update_playlists(
     custom_playlist: Optional[str] = None,
     dry_run: bool = False,
 ):
+    """Update playlist structure with newly added tracks.
+
+    track_entries: list of {"track_id": str, "meta": dict}
+    """
     if not track_entries or dry_run:
         return
 
@@ -167,6 +300,11 @@ def update_playlists(
 
 
 def rebuild_playlists(xml_path: Path, as_json: bool = False):
+    """Rebuild all playlists from existing XML tracks.
+
+    Styles are extracted from Comments (e.g. "Techno, Acid | Cat# XYZ").
+    Labels are read from the Label attribute.
+    """
     import json
 
     tree, root, _ = load_or_bootstrap_xml(xml_path)
@@ -247,9 +385,9 @@ def rebuild_playlists(xml_path: Path, as_json: bool = False):
             "top_labels": sorted(label_counts.items(), key=lambda x: -x[1])[:15],
         }, indent=2))
     else:
-        print(f"\n{'═' * 64}")
+        print(f"\n{'=' * 64}")
         print(f"  Playlist Rebuild — {len(tracks)} tracks")
-        print(f"{'═' * 64}")
+        print(f"{'=' * 64}")
         print(f"  Style playlists:  {len(style_counts)}")
         print(f"  Label playlists:  {len(label_counts)}")
         print(f"  Recent playlist:  {min(len(tracks), RECENT_PLAYLIST_CAP)} tracks")
@@ -259,5 +397,5 @@ def rebuild_playlists(xml_path: Path, as_json: bool = False):
         print(f"\n  Top labels:")
         for l, c in sorted(label_counts.items(), key=lambda x: -x[1])[:10]:
             print(f"    {c:4d}  {l}")
-        print(f"\n{'═' * 64}")
-        print(f"  XML saved → {xml_path}\n")
+        print(f"\n{'=' * 64}")
+        print(f"  XML saved -> {xml_path}\n")
