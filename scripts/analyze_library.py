@@ -1,4 +1,4 @@
-#!/home/kaitlyn/dev/trackstage/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Analyze full library — run audio analysis, write tags, update Rekordbox XML.
 
@@ -36,8 +36,8 @@ from trackstage.pipeline import (
     load_or_bootstrap_xml, _save_xml,
 )
 from trackstage.cue_detection import CUE_COLORS
+from trackstage.cache import AnalysisCache
 
-LIBRARY = Path("/mnt/c/Users/Kaitlyn/Music/Library")
 EXTENSIONS = {'.flac', '.mp3', '.aiff', '.aif', '.m4a'}
 
 
@@ -181,23 +181,36 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze full DJ library")
     parser.add_argument("--force", action="store_true", help="Re-analyze already tagged tracks")
     parser.add_argument("--dry-run", action="store_true", help="Analyze without writing tags")
+    parser.add_argument("--library", type=Path, default=None,
+                        help="Library path (or set LIBRARY_PATH in .env)")
     args = parser.parse_args()
+
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+
+    library = args.library or Path(os.environ.get("LIBRARY_PATH", ""))
+    if not library or not library.exists():
+        print(f"ERROR: Library not found. Pass --library or set LIBRARY_PATH in .env.")
+        sys.exit(1)
 
     xml_path = Path(os.environ.get("XML_PATH", ""))
     if not xml_path.name:
-        from dotenv import load_dotenv
-        load_dotenv(Path(__file__).parent.parent / ".env")
-        xml_path = Path(os.environ.get("XML_PATH", ""))
+        print("ERROR: XML_PATH not set in .env.")
+        sys.exit(1)
 
     tracks = sorted([
-        f for f in LIBRARY.rglob("*")
+        f for f in library.rglob("*")
         if f.suffix.lower() in EXTENSIONS and f.is_file()
     ])
     print(f"Found {len(tracks)} tracks in library.")
 
+    # SQLite cache for resumable analysis
+    cache = AnalysisCache()
+    print(f"Cache: {cache.count()} previous results stored.")
+
     if not args.force:
         before = len(tracks)
-        tracks = [t for t in tracks if not has_replaygain(t)]
+        tracks = [t for t in tracks if cache.get(t) is None and not has_replaygain(t)]
         skipped = before - len(tracks)
         if skipped:
             print(f"Skipping {skipped} already-analyzed tracks. Use --force to redo.")
@@ -227,17 +240,20 @@ def main():
     for i, fp in enumerate(tracks):
         t0 = time.time()
         try:
-            r = analyze_track(fp)
+            # Check cache first
+            cached = cache.get(fp) if not args.force else None
+            if cached:
+                r = cached
+            else:
+                r = analyze_track(fp)
+                cache.put(fp, r)
 
             if not args.dry_run:
-                # Write analysis tags to file (preserves existing Discogs metadata)
                 write_analysis_tags(fp, r)
 
-                # Write ReplayGain tags
                 if r.get("loudness") and r["loudness"].get("gain_db") is not None:
                     write_replaygain_tags(fp, r["loudness"])
 
-                # Update Rekordbox XML entry
                 loc = to_rb_location(fp)
                 track_el = existing_loc_map.get(loc)
                 if track_el is not None:
@@ -248,7 +264,6 @@ def main():
                     if r.get("vibes"):
                         track_el.set("Grouping", sanitize_xml(", ".join(r["vibes"])))
 
-                    # Replace cue points
                     if r.get("cues"):
                         for old_cue in track_el.findall("POSITION_MARK"):
                             track_el.remove(old_cue)
@@ -286,7 +301,8 @@ def main():
             elapsed = time.time() - t0
             print(f"  [{i+1:>4}/{len(tracks)}] ERROR ({elapsed:.1f}s): {fp.name}: {e}")
 
-    # Save XML once at the end
+    cache.close()
+
     if not args.dry_run and xml_updated > 0:
         _save_xml(tree, xml_path)
         print(f"\nXML updated: {xml_updated} tracks → {xml_path}")

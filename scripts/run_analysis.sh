@@ -3,8 +3,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV="$SCRIPT_DIR/../.venv"
-NVIDIA="$VENV/lib/python3.12/site-packages/nvidia"
+VENV="${TRACKSTAGE_VENV:-$SCRIPT_DIR/../.venv}"
+PYTHON_VER=$(basename "$VENV"/lib/python3.*)
+NVIDIA="$VENV/lib/$PYTHON_VER/site-packages/nvidia"
 
 if [ -d "$NVIDIA" ]; then
     CUDA_DIRS=$(find "$NVIDIA" -name lib -type d | tr '\n' ':')

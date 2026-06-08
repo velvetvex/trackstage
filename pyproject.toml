@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 analysis = [
     "essentia>=2.1b6",
-    "essentia-tensorflow>=2.1b6",
+    "tensorflow[and-cuda]>=2.15",
 ]
 
 [project.scripts]
