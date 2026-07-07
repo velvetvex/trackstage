@@ -22,6 +22,8 @@ One conversational command — **"add &lt;song&gt;"** — sources the track (Sou
 
 - **Rekordbox usually closed when adding** → write to `master.db` immediately; no queue/flush machinery. If Rekordbox is running, refuse the write and tell the user to close it.
 - **Confirm on ambiguity** → auto-pick when one clearly-best FLAC exists; show a ranked shortlist and let the user choose when distinct versions exist (original vs remix vs edit).
+- **No-FLAC fallback → MP3 320kbps** → if no FLAC (or lossless), auto-take the best MP3 ≥320kbps without asking. Below 320kbps → abort and report (don't silently accept low-bitrate).
+- **Gain normalization required** → compute integrated loudness (EBU R128 / ReplayGain) via Essentia in the analyzer; write ReplayGain tags to the file (mutagen) for portability. Rekordbox computes its own track gain on load; the RG tags travel with the file for other players.
 - **"Fully in library" = metadata + tags** → waveform/beatgrid (ANLZ) are NOT pre-generated; Rekordbox builds them when the track is first loaded. Essentia BPM + key ARE pre-written so the track is usable immediately.
 - **Reuse brains, replace backend** → keep trackstage's analyzer / Discogs matching / tag computation / cue / loudness modules. Delete `xml.py`, XML generation, the manual-import step, and the standalone `sync_rekordbox.py` pass. Build one new direct-to-DB writer + a conversational skill.
 
@@ -33,8 +35,8 @@ Five units with clear interfaces, orchestrated by a `trackstage add` engine and 
 |---|---|---|
 | **sourcer** | query → local file path + ranked candidate list | NEW — wraps slskd MCP (search / responses / enqueue / downloads) |
 | **identifier** | file / name → Discogs release metadata | REUSE — extract Discogs matching from `pipeline.py` |
-| **analyzer** | file → `{bpm, key, camelot, energy, danceability, moods, vibes, vocal, cues}` | REUSE — `analyzer.py`, unchanged |
-| **organizer** | file + metadata → final Library path + written file tags | REUSE — file-org logic + `tags.py` |
+| **analyzer** | file → `{bpm, key, camelot, energy, danceability, moods, vibes, vocal, cues, loudness_lufs, replaygain_db}` | REUSE — `analyzer.py` + add EBU R128 loudness (Essentia `LoudnessEBUR128`) |
+| **organizer** | file + metadata → final Library path + written file tags (incl. ReplayGain) | REUSE — file-org logic + `tags.py`; add RG tag write via mutagen |
 | **dbwriter** | Library path + metadata + analysis → Content ID + playlist rows | **NEW — the heart** |
 
 ### dbwriter (new — replaces `xml.py` + `sync_rekordbox.py`)
@@ -63,14 +65,15 @@ One pyrekordbox transaction against `master.db`:
 
 ```
 user: "add E Talking by Soulwax"
-  → sourcer: slskd search, filter FLAC, rank (free slot / queue / quality)
+  → sourcer: slskd search, rank (FLAC > MP3≥320; free slot / queue / quality)
        ambiguous (distinct versions)? → show ranked shortlist, user picks
        one clear best? → auto
+       no FLAC? → best MP3≥320 auto; nothing ≥320 → abort
   → enqueue → wait for completion in Inbox
        dead peer / stall? → retry next ranked source (≤3)
   → identifier: Discogs match
        low confidence? → confirm / fall back to file tags + filename
-  → analyzer: Essentia → bpm, key, energy, mood, cues (cached)
+  → analyzer: Essentia → bpm, key, energy, mood, cues, loudness/RG (cached)
   → organizer: move → Library/{Year}/{Release [Label CatNo]}/Artist - Title.ext
        write file tags (mutagen) for portability
   → dbwriter: [Rekordbox closed? backup master.db] → one txn:
@@ -87,7 +90,7 @@ next Rekordbox launch: track present; waveform builds on first load
 
 | Failure | Behavior |
 |---|---|
-| No FLAC on Soulseek | Offer best MP3 / AIFF / M4A instead, or abort — ask the user |
+| No FLAC on Soulseek | Auto-take best MP3 ≥320kbps (no prompt). Nothing ≥320kbps → abort + report |
 | Download stalls / dead peer | Auto-retry next ranked source (≤3), then report failure |
 | Discogs no / low match | Fall back to file tags + filename; report what was used; offer manual `--discogs-id` |
 | Rekordbox running | Refuse DB write, tell user to close it. Nothing half-written |
@@ -112,7 +115,6 @@ next Rekordbox launch: track present; waveform builds on first load
 - Queue/flush-while-Rekordbox-open (user adds with RB closed)
 - Waveform/beatgrid pre-generation (Rekordbox builds on load)
 - Batch "add N songs" in one command (v1 is one track; batching is a later iteration)
-- Loudness/ReplayGain pass (optional; not required for v1 "shows up in library")
 
 ## Follow-up
 
