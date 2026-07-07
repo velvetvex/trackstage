@@ -33,7 +33,6 @@ import argparse
 import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote
 from typing import Optional
 
 import requests
@@ -44,12 +43,14 @@ try:
 except ImportError:
     pass
 
+from .tags import read_tags, write_tags, build_comment, EXTENSIONS as AUDIO_EXTS_TAG
+from .xml import (
+    to_rb_location, sanitize_xml, load_or_bootstrap_xml, save_xml,
+    update_playlists, rebuild_playlists, KIND_MAP, RECENT_PLAYLIST_CAP,
+)
+
 try:
     from mutagen.mp3 import MP3
-    from mutagen.id3 import (
-        ID3, ID3NoHeaderError,
-        TCON, TPUB, TDRC, TYER, TALB, COMM, TXXX, TIT2, TPE1, TKEY, TBPM,
-    )
     from mutagen.flac import FLAC
     from mutagen.aiff import AIFF
     from mutagen.mp4 import MP4
@@ -101,8 +102,6 @@ REQUESTS_PER_MIN  = 55
 DEFAULT_THRESHOLD = 85
 REVIEW_THRESHOLD  = 60
 MAX_NAME_LENGTH   = 180
-RECENT_PLAYLIST_CAP = 100
-
 AUDIO_EXTS   = {".mp3", ".flac", ".aiff", ".aif", ".m4a"}
 ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz"}
 
@@ -113,13 +112,6 @@ NON_MUSIC_EXTS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".pdf", ".docx",
 }
 
-KIND_MAP = {
-    ".mp3":  "MP3 File",
-    ".flac": "FLAC File",
-    ".aiff": "AIFF File",
-    ".aif":  "AIFF File",
-    ".m4a":  "AAC File",
-}
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -219,44 +211,6 @@ def unique_dest(path: Path) -> Path:
         n += 1
 
 
-# ── Tag reading ───────────────────────────────────────────────────────────────
-
-def read_tags(fp: Path) -> dict:
-    ext  = fp.suffix.lower()
-    tags = {"artist": "", "title": ""}
-    try:
-        if ext == ".mp3":
-            a = MP3(fp, ID3=ID3)
-            if a.tags:
-                tags["artist"] = str(a.tags.get("TPE1", "")).strip()
-                tags["title"]  = str(a.tags.get("TIT2", "")).strip()
-        elif ext == ".flac":
-            a = FLAC(fp)
-            tags["artist"] = ", ".join(a.get("artist", []))
-            tags["title"]  = ", ".join(a.get("title",  []))
-        elif ext in (".aiff", ".aif"):
-            a = AIFF(fp)
-            if a.tags:
-                tags["artist"] = str(a.tags.get("TPE1", "")).strip()
-                tags["title"]  = str(a.tags.get("TIT2", "")).strip()
-        elif ext == ".m4a":
-            a = MP4(fp)
-            tags["artist"] = ", ".join(a.get("\xa9ART", []))
-            tags["title"]  = ", ".join(a.get("\xa9nam", []))
-    except Exception:
-        pass
-
-    if not tags["title"]:
-        stem = fp.stem
-        if " - " in stem:
-            parts = stem.split(" - ", 1)
-            if not tags["artist"]:
-                tags["artist"] = parts[0].strip()
-            tags["title"] = parts[1].strip()
-        else:
-            tags["title"] = stem.strip()
-
-    return tags
 
 
 # ── Confidence scoring ────────────────────────────────────────────────────────
@@ -404,159 +358,6 @@ def parse_bandcamp_url(url: str, default_artist: str, default_title: str) -> Opt
     }, artist, title)
 
 
-# ── Tag writing ───────────────────────────────────────────────────────────────
-
-def _build_comment(meta: dict) -> str:
-    parts = [p for p in [
-        meta.get("styles", ""),
-        f"Cat# {meta['catno']}" if meta.get("catno") else "",
-        f"Energy: {meta['energy']}/10" if meta.get("energy") else "",
-        f"Dance: {meta['danceability']}/10" if meta.get("danceability") else "",
-        meta.get("vibes", ""),
-        meta.get("vocal", ""),
-    ] if p]
-    return " | ".join(parts)
-
-
-def write_mp3(fp: Path, meta: dict, dry_run: bool) -> bool:
-    try:
-        try:
-            tags = ID3(fp)
-        except ID3NoHeaderError:
-            tags = ID3()
-        if meta.get("genre"):  tags["TCON"] = TCON(encoding=3, text=meta["genre"])
-        if meta.get("album"):  tags["TALB"] = TALB(encoding=3, text=meta["album"])
-        if meta.get("label"):  tags["TPUB"] = TPUB(encoding=3, text=meta["label"])
-        if meta.get("year"):
-            tags["TDRC"] = TDRC(encoding=3, text=meta["year"])
-            tags["TYER"] = TYER(encoding=3, text=meta["year"])
-        if meta.get("catno"):
-            tags["TXXX:CATALOGNUMBER"] = TXXX(
-                encoding=3, desc="CATALOGNUMBER", text=meta["catno"]
-            )
-        if meta.get("initial_key"):
-            tags["TKEY"] = TKEY(encoding=3, text=meta["initial_key"])
-        if meta.get("bpm"):
-            tags["TBPM"] = TBPM(encoding=3, text=meta["bpm"])
-        if meta.get("energy"):
-            tags["TXXX:ENERGY"] = TXXX(encoding=3, desc="ENERGY", text=meta["energy"])
-        if meta.get("danceability"):
-            tags["TXXX:DANCEABILITY"] = TXXX(encoding=3, desc="DANCEABILITY", text=meta["danceability"])
-        c = _build_comment(meta)
-        if c:
-            tags["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=c)
-        if not dry_run:
-            tags.save(fp, v2_version=3)
-        return True
-    except Exception as e:
-        log.error(f"  ✗  MP3 write failed: {e}")
-        return False
-
-
-def write_flac(fp: Path, meta: dict, dry_run: bool) -> bool:
-    try:
-        a = FLAC(fp)
-        if meta.get("genre"):  a["genre"]         = [meta["genre"]]
-        if meta.get("styles"): a["style"]          = [meta["styles"]]
-        if meta.get("album"):  a["album"]          = [meta["album"]]
-        if meta.get("label"):
-            a["label"]        = [meta["label"]]
-            a["organization"] = [meta["label"]]
-        if meta.get("catno"):  a["catalognumber"]  = [meta["catno"]]
-        if meta.get("year"):
-            a["date"] = [meta["year"]]
-            a["year"] = [meta["year"]]
-        if meta.get("initial_key"):  a["initialkey"] = [meta["initial_key"]]
-        if meta.get("bpm"):          a["bpm"]        = [meta["bpm"]]
-        if meta.get("energy"):       a["energy"]     = [meta["energy"]]
-        if meta.get("danceability"): a["danceability"] = [meta["danceability"]]
-        c = _build_comment(meta)
-        if c:
-            a["comment"] = [c]
-        if not dry_run:
-            a.save()
-        return True
-    except Exception as e:
-        log.error(f"  ✗  FLAC write failed: {e}")
-        return False
-
-
-def write_aiff(fp: Path, meta: dict, dry_run: bool) -> bool:
-    try:
-        a = AIFF(fp)
-        if a.tags is None:
-            a.add_tags()
-        if meta.get("genre"):  a.tags["TCON"] = TCON(encoding=3, text=meta["genre"])
-        if meta.get("album"):  a.tags["TALB"] = TALB(encoding=3, text=meta["album"])
-        if meta.get("label"):  a.tags["TPUB"] = TPUB(encoding=3, text=meta["label"])
-        if meta.get("year"):   a.tags["TDRC"] = TDRC(encoding=3, text=meta["year"])
-        if meta.get("catno"):
-            a.tags["TXXX:CATALOGNUMBER"] = TXXX(
-                encoding=3, desc="CATALOGNUMBER", text=meta["catno"]
-            )
-        if meta.get("initial_key"):
-            a.tags["TKEY"] = TKEY(encoding=3, text=meta["initial_key"])
-        if meta.get("bpm"):
-            a.tags["TBPM"] = TBPM(encoding=3, text=meta["bpm"])
-        if meta.get("energy"):
-            a.tags["TXXX:ENERGY"] = TXXX(encoding=3, desc="ENERGY", text=meta["energy"])
-        if meta.get("danceability"):
-            a.tags["TXXX:DANCEABILITY"] = TXXX(encoding=3, desc="DANCEABILITY", text=meta["danceability"])
-        c = _build_comment(meta)
-        if c:
-            a.tags["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=c)
-        if not dry_run:
-            a.save()
-        return True
-    except Exception as e:
-        log.error(f"  ✗  AIFF write failed: {e}")
-        return False
-
-
-def write_m4a(fp: Path, meta: dict, dry_run: bool) -> bool:
-    try:
-        a = MP4(fp)
-        if meta.get("genre"):  a["\xa9gen"] = [meta["genre"]]
-        if meta.get("album"):  a["\xa9alb"] = [meta["album"]]
-        if meta.get("year"):   a["\xa9day"] = [meta["year"]]
-        if meta.get("label"):
-            a["----:com.apple.iTunes:LABEL"] = [meta["label"].encode("utf-8")]
-        if meta.get("catno"):
-            a["----:com.apple.iTunes:CATALOGNUMBER"] = [meta["catno"].encode("utf-8")]
-        if meta.get("styles"):
-            a["----:com.apple.iTunes:STYLE"] = [meta["styles"].encode("utf-8")]
-        if meta.get("initial_key"):
-            a["----:com.apple.iTunes:INITIALKEY"] = [meta["initial_key"].encode("utf-8")]
-        if meta.get("bpm"):
-            a["tmpo"] = [int(float(meta["bpm"]))]
-        if meta.get("energy"):
-            a["----:com.apple.iTunes:ENERGY"] = [meta["energy"].encode("utf-8")]
-        if meta.get("danceability"):
-            a["----:com.apple.iTunes:DANCEABILITY"] = [meta["danceability"].encode("utf-8")]
-        c = _build_comment(meta)
-        if c:
-            a["\xa9cmt"] = [c]
-        if not dry_run:
-            a.save()
-        return True
-    except Exception as e:
-        log.error(f"  ✗  M4A write failed: {e}")
-        return False
-
-
-def write_tags(fp: Path, meta: dict, dry_run: bool) -> bool:
-    writers = {
-        ".mp3":  write_mp3,
-        ".flac": write_flac,
-        ".aiff": write_aiff,
-        ".aif":  write_aiff,
-        ".m4a":  write_m4a,
-    }
-    fn = writers.get(fp.suffix.lower())
-    if fn:
-        return fn(fp, meta, dry_run)
-    log.warning(f"  ⚠  No tag writer for format: {fp.suffix}")
-    return False
 
 
 # ── Audio info ────────────────────────────────────────────────────────────────
@@ -580,155 +381,8 @@ def read_audio_info(fp: Path) -> dict:
     return info
 
 
-# ── Rekordbox XML helpers ─────────────────────────────────────────────────────
-
-def to_rb_location(path: Path) -> str:
-    posix = path.as_posix()
-    # Convert WSL /mnt/X/ paths to Windows X:/ for Rekordbox compatibility
-    import re as _re
-    m = _re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
-    if m:
-        posix = f"{m.group(1).upper()}:/{m.group(2)}"
-    encoded = quote(posix, safe="/:@!$&'()*+,;=-._~")
-    if not encoded.startswith("/"):
-        encoded = "/" + encoded
-    return f"file://localhost{encoded}"
 
 
-def sanitize_xml(s: str) -> str:
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(s))
-
-
-def load_or_bootstrap_xml(xml_path: Path) -> tuple:
-    if not xml_path.exists():
-        root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
-        ET.SubElement(root, "PRODUCT",
-                      Name="rekordbox", Version="7.0.0", Company="AlphaTheta")
-        ET.SubElement(root, "COLLECTION", Entries="0")
-        pl = ET.SubElement(root, "PLAYLISTS")
-        ET.SubElement(pl, "NODE", Type="0", Name="ROOT", Count="0")
-        return ET.ElementTree(root), root, 0
-
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    max_id = 0
-    for track in root.findall(".//COLLECTION/TRACK"):
-        try:
-            max_id = max(max_id, int(track.get("TrackID", 0)))
-        except ValueError:
-            pass
-    return tree, root, max_id
-
-
-def _save_xml(tree: ET.ElementTree, xml_path: Path):
-    ET.indent(tree, space="  ")
-    xml_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(xml_path, "wb") as f:
-        f.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-        tree.write(f, encoding="utf-8", xml_declaration=False)
-
-
-# ── Playlist management ──────────────────────────────────────────────────────
-
-def _find_or_create_folder(parent_node: ET.Element, name: str) -> ET.Element:
-    for child in parent_node:
-        if child.get("Type") == "0" and child.get("Name") == name:
-            return child
-    folder = ET.SubElement(parent_node, "NODE", Type="0", Name=name, Count="0")
-    return folder
-
-
-def _find_or_create_playlist(parent_node: ET.Element, name: str) -> ET.Element:
-    for child in parent_node:
-        if child.get("Type") == "1" and child.get("Name") == name:
-            return child
-    playlist = ET.SubElement(parent_node, "NODE",
-                             Type="1", Name=name, KeyType="0", Entries="0")
-    return playlist
-
-
-def _add_track_to_playlist(playlist: ET.Element, track_id: str):
-    for existing in playlist:
-        if existing.get("Key") == track_id:
-            return
-    ET.SubElement(playlist, "TRACK", Key=track_id)
-    current = int(playlist.get("Entries", "0"))
-    playlist.set("Entries", str(current + 1))
-
-
-def _trim_playlist(playlist: ET.Element, max_entries: int):
-    tracks = list(playlist.findall("TRACK"))
-    if len(tracks) <= max_entries:
-        return
-    for track in tracks[:len(tracks) - max_entries]:
-        playlist.remove(track)
-    playlist.set("Entries", str(max_entries))
-
-
-def _update_folder_counts(root_node: ET.Element):
-    count = 0
-    for child in root_node:
-        if child.tag == "NODE":
-            count += 1
-            if child.get("Type") == "0":
-                _update_folder_counts(child)
-    root_node.set("Count", str(count))
-
-
-def update_playlists(
-    root: ET.Element,
-    track_entries: list,
-    custom_playlist: Optional[str] = None,
-    dry_run: bool = False,
-):
-    """
-    Update playlist structure with newly added tracks.
-
-    track_entries: list of {"track_id": str, "meta": dict}
-    """
-    if not track_entries or dry_run:
-        return
-
-    playlists_node = root.find("PLAYLISTS")
-    if playlists_node is None:
-        playlists_node = ET.SubElement(root, "PLAYLISTS")
-
-    root_node = playlists_node.find("NODE[@Name='ROOT']")
-    if root_node is None:
-        root_node = ET.SubElement(playlists_node, "NODE",
-                                  Type="0", Name="ROOT", Count="0")
-
-    styles_folder = _find_or_create_folder(root_node, "Styles")
-    labels_folder = _find_or_create_folder(root_node, "Labels")
-    recent_pl = _find_or_create_playlist(root_node, "Recent")
-
-    custom_pl = None
-    if custom_playlist:
-        custom_pl = _find_or_create_playlist(root_node, custom_playlist)
-
-    for entry in track_entries:
-        tid = entry["track_id"]
-        meta = entry["meta"]
-
-        styles_str = meta.get("styles", "")
-        for style in styles_str.split(", "):
-            style = style.strip()
-            if style:
-                pl = _find_or_create_playlist(styles_folder, style)
-                _add_track_to_playlist(pl, tid)
-
-        label = meta.get("label", "").strip()
-        if label:
-            pl = _find_or_create_playlist(labels_folder, label)
-            _add_track_to_playlist(pl, tid)
-
-        _add_track_to_playlist(recent_pl, tid)
-
-        if custom_pl:
-            _add_track_to_playlist(custom_pl, tid)
-
-    _trim_playlist(recent_pl, RECENT_PLAYLIST_CAP)
-    _update_folder_counts(root_node)
 
 
 # ── Collection + XML update ──────────────────────────────────────────────────
@@ -769,7 +423,7 @@ def append_tracks_to_xml(
         ainfo   = read_audio_info(fp) if fp.exists() else {
             "total_time": "0", "bitrate": "0", "samplerate": "0"
         }
-        comment = sanitize_xml(_build_comment(meta))
+        comment = sanitize_xml(build_comment(meta))
 
         attrs = {
             "TrackID":     str(max_id),
@@ -819,7 +473,7 @@ def append_tracks_to_xml(
         current = int(collection.get("Entries", "0"))
         collection.set("Entries", str(current + len(added)))
         update_playlists(root, added, custom_playlist, dry_run)
-        _save_xml(tree, xml_path)
+        save_xml(tree, xml_path)
 
     verb = "[DRY RUN] Would add" if dry_run else "✓  Added"
     log.info(f"  {verb} {len(added)} track(s) to XML → {xml_path}")
@@ -1328,110 +982,6 @@ def process_release_folder(folder, client, library, threshold, dry_run,
     return results_out
 
 
-# ── Rebuild playlists from existing XML ───────────────────────────────────────
-
-def rebuild_playlists(xml_path: Path, as_json: bool = False):
-    """
-    Parse all existing tracks in COLLECTION and build Styles/, Labels/,
-    and Recent playlists from their metadata fields.
-
-    Styles are extracted from Comments (e.g. "Techno, Acid | Cat# XYZ").
-    Labels are read from the Label attribute.
-    """
-    tree, root, _ = load_or_bootstrap_xml(xml_path)
-    collection = root.find("COLLECTION")
-    if collection is None:
-        if as_json:
-            print(json.dumps({"error": "No COLLECTION in XML"}))
-        else:
-            print("  No COLLECTION found in XML.")
-        return
-
-    tracks = collection.findall("TRACK")
-    if not tracks:
-        if as_json:
-            print(json.dumps({"error": "No tracks in XML"}))
-        else:
-            print("  No tracks in XML.")
-        return
-
-    # Wipe existing auto-playlists to rebuild clean
-    playlists_node = root.find("PLAYLISTS")
-    if playlists_node is None:
-        playlists_node = ET.SubElement(root, "PLAYLISTS")
-
-    root_node = playlists_node.find("NODE[@Name='ROOT']")
-    if root_node is None:
-        root_node = ET.SubElement(playlists_node, "NODE",
-                                  Type="0", Name="ROOT", Count="0")
-
-    for name in ("Styles", "Labels"):
-        for child in list(root_node):
-            if child.get("Type") == "0" and child.get("Name") == name:
-                root_node.remove(child)
-
-    for child in list(root_node):
-        if child.get("Type") == "1" and child.get("Name") == "Recent":
-            root_node.remove(child)
-
-    styles_folder = _find_or_create_folder(root_node, "Styles")
-    labels_folder = _find_or_create_folder(root_node, "Labels")
-    recent_pl = _find_or_create_playlist(root_node, "Recent")
-
-    style_counts = {}
-    label_counts = {}
-
-    for track in tracks:
-        tid = track.get("TrackID", "")
-        label = track.get("Label", "").strip()
-        comments = track.get("Comments", "").strip()
-
-        # Parse styles from Comments: "Techno, Acid | Cat# XYZ" → ["Techno", "Acid"]
-        styles_str = comments.split(" | ")[0] if comments else ""
-        if styles_str.startswith("Cat#"):
-            styles_str = ""
-
-        for style in styles_str.split(", "):
-            style = style.strip()
-            if style:
-                pl = _find_or_create_playlist(styles_folder, style)
-                _add_track_to_playlist(pl, tid)
-                style_counts[style] = style_counts.get(style, 0) + 1
-
-        if label:
-            pl = _find_or_create_playlist(labels_folder, label)
-            _add_track_to_playlist(pl, tid)
-            label_counts[label] = label_counts.get(label, 0) + 1
-
-        _add_track_to_playlist(recent_pl, tid)
-
-    _trim_playlist(recent_pl, RECENT_PLAYLIST_CAP)
-    _update_folder_counts(root_node)
-    _save_xml(tree, xml_path)
-
-    if as_json:
-        print(json.dumps({
-            "tracks": len(tracks),
-            "style_playlists": len(style_counts),
-            "label_playlists": len(label_counts),
-            "top_styles": sorted(style_counts.items(), key=lambda x: -x[1])[:15],
-            "top_labels": sorted(label_counts.items(), key=lambda x: -x[1])[:15],
-        }, indent=2))
-    else:
-        print(f"\n{'═' * 64}")
-        print(f"  Playlist Rebuild — {len(tracks)} tracks")
-        print(f"{'═' * 64}")
-        print(f"  Style playlists:  {len(style_counts)}")
-        print(f"  Label playlists:  {len(label_counts)}")
-        print(f"  Recent playlist:  {min(len(tracks), RECENT_PLAYLIST_CAP)} tracks")
-        print(f"\n  Top styles:")
-        for s, c in sorted(style_counts.items(), key=lambda x: -x[1])[:15]:
-            print(f"    {c:4d}  {s}")
-        print(f"\n  Top labels:")
-        for l, c in sorted(label_counts.items(), key=lambda x: -x[1])[:10]:
-            print(f"    {c:4d}  {l}")
-        print(f"\n{'═' * 64}")
-        print(f"  XML saved → {xml_path}\n")
 
 
 # ── Main pipeline ────────────────────────────────────────────────────────────

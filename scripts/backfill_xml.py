@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Backfill Rekordbox XML from analysis cache — no re-analysis needed."""
 
+import json
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -9,6 +10,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from pathlib import Path
 from dotenv import load_dotenv
+from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
+from mutagen.aiff import AIFF
+from mutagen.id3 import ID3, ID3NoHeaderError, TIT1
 
 from trackstage.cache import AnalysisCache
 from trackstage.pipeline import (
@@ -19,6 +24,96 @@ from trackstage.cue_detection import CUE_COLORS
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 EXTENSIONS = {'.flac', '.mp3', '.aiff', '.aif', '.m4a'}
+
+# Rekordbox Rating: 0/51/102/153/204/255 → 0-5 stars
+ENERGY_TO_RATING = {
+    "1": 51, "2": 51,
+    "3": 102, "4": 102,
+    "5": 153, "6": 153,
+    "7": 204, "8": 204,
+    "9": 255, "10": 255,
+}
+
+# Rekordbox track colors (hex values used in XML Colour attribute)
+MOOD_TO_COLOUR = {
+    "aggressive": "0xFF0000",  # Red
+    "happy":      "0xFFA500",  # Orange
+    "party":      "0xFFFF00",  # Yellow
+    "relaxed":    "0x00FF00",  # Green
+    "sad":        "0x8000FF",  # Purple
+}
+
+
+def build_grouping(r: dict) -> str:
+    parts = list(r.get("vibes", []))
+    for m in r.get("moods", []):
+        if m not in parts:
+            parts.append(m)
+    return ", ".join(parts)
+
+
+def pick_colour(moods: list) -> str:
+    priority = ["aggressive", "sad", "happy", "party", "relaxed"]
+    for mood in priority:
+        if mood in moods:
+            return MOOD_TO_COLOUR[mood]
+    return ""
+
+
+def merge_xml_comment(existing: str, r: dict) -> str:
+    """Append analysis fields to existing XML comment without clobbering Discogs data."""
+    parts = [p.strip() for p in existing.split(" | ")] if existing else []
+    cleaned = []
+    vibe_words = {"dark", "euphoric", "deep", "melancholic", "driving"}
+    for p in parts:
+        if p.startswith("Energy:") or p.startswith("Dance:"):
+            continue
+        if p in ("instrumental", "voice", ""):
+            continue
+        sub = [s.strip().lower() for s in p.split(",")]
+        if all(s in vibe_words for s in sub if s):
+            continue
+        cleaned.append(p)
+
+    if r.get("energy"):
+        cleaned.append(f"Energy: {r['energy']}/10")
+    if r.get("danceability"):
+        cleaned.append(f"Dance: {r['danceability']}/10")
+    if r.get("vibes"):
+        cleaned.append(", ".join(r["vibes"]))
+    if r.get("vocal"):
+        cleaned.append(r["vocal"])
+    return " | ".join(cleaned)
+
+
+def write_grouping_tag(fp: Path, grouping: str) -> bool:
+    ext = fp.suffix.lower()
+    try:
+        if ext == '.flac':
+            a = FLAC(fp)
+            a["grouping"] = [grouping]
+            a.save()
+        elif ext == '.mp3':
+            try:
+                tags = ID3(fp)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags["TIT1"] = TIT1(encoding=3, text=grouping)
+            tags.save(fp, v2_version=3)
+        elif ext in ('.aiff', '.aif'):
+            a = AIFF(fp)
+            if a.tags is None:
+                a.add_tags()
+            a.tags["TIT1"] = TIT1(encoding=3, text=grouping)
+            a.save()
+        elif ext == '.m4a':
+            a = MP4(fp)
+            a["\xa9grp"] = [grouping]
+            a.save()
+        return True
+    except Exception as e:
+        print(f"  TAG ERROR: {fp.name}: {e}")
+        return False
 
 
 def main():
@@ -51,10 +146,9 @@ def main():
         if f.suffix.lower() in EXTENSIONS and f.is_file()
     ])
 
-    # Build path→result map ignoring mtime (tags write changed mtime after caching)
     cache_by_path = {}
     for row in cache.conn.execute("SELECT path, result FROM analysis"):
-        cache_by_path[row[0]] = __import__("json").loads(row[1])
+        cache_by_path[row[0]] = json.loads(row[1])
     print(f"Cache paths loaded: {len(cache_by_path)}")
 
     updated = 0
@@ -75,19 +169,39 @@ def main():
 
         changed = False
 
-        if r.get("bpm") and track_el.get("AverageBpm") in ("0.00", "", None):
+        if r.get("bpm"):
             track_el.set("AverageBpm", r["bpm"])
             changed = True
 
-        if r.get("camelot") and not track_el.get("Tonality"):
+        if r.get("camelot"):
             track_el.set("Tonality", r["camelot"])
             changed = True
 
-        if r.get("vibes") and not track_el.get("Grouping"):
-            track_el.set("Grouping", sanitize_xml(", ".join(r["vibes"])))
+        grouping = build_grouping(r)
+        if grouping:
+            track_el.set("Grouping", sanitize_xml(grouping))
+            write_grouping_tag(fp, grouping)
             changed = True
 
-        if r.get("cues") and not track_el.findall("POSITION_MARK"):
+        new_comment = merge_xml_comment(track_el.get("Comments", ""), r)
+        if new_comment != track_el.get("Comments", ""):
+            track_el.set("Comments", sanitize_xml(new_comment))
+            changed = True
+
+        if r.get("energy"):
+            rating = ENERGY_TO_RATING.get(r["energy"], 0)
+            if rating:
+                track_el.set("Rating", str(rating))
+                changed = True
+
+        colour = pick_colour(r.get("moods", []))
+        if colour:
+            track_el.set("Colour", colour)
+            changed = True
+
+        if r.get("cues"):
+            for old_cue in track_el.findall("POSITION_MARK"):
+                track_el.remove(old_cue)
             for cue in r["cues"]:
                 cue_colors = CUE_COLORS.get(cue["type"], {})
                 cue_attrs = {
