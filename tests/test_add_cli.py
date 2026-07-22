@@ -30,3 +30,30 @@ def test_add_parses_query_and_flags(monkeypatch):
     assert captured["query"] == "E Talking by Soulwax"
     assert captured["dry_run"] is True
     assert captured["fmt"] == "any"
+
+
+from trackstage.add import parse_query
+
+
+class TestParseQuery:
+    def test_by_form_splits_and_reorders(self):
+        artist, title, search = parse_query("enchantress 1200 by legowelt")
+        assert artist == "legowelt"
+        assert title == "enchantress 1200"
+        assert search == "legowelt enchantress 1200"  # artist-first, no 'by'
+
+    def test_no_by_leaves_query_unchanged(self):
+        artist, title, search = parse_query("legowelt enchantress 1200")
+        assert artist == ""
+        assert title == "legowelt enchantress 1200"
+        assert search == "legowelt enchantress 1200"
+
+    def test_case_insensitive_by(self):
+        artist, title, search = parse_query("Windowlicker BY Aphex Twin")
+        assert artist == "Aphex Twin"
+        assert title == "Windowlicker"
+        assert search == "Aphex Twin Windowlicker"
+
+    def test_no_search_pollution_from_by(self):
+        _, _, search = parse_query("track by artist")
+        assert " by " not in f" {search} "

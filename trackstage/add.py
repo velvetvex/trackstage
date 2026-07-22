@@ -7,6 +7,7 @@ write directly to Rekordbox master.db. No XML, no manual import.
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -36,6 +37,25 @@ except ImportError:
 DEFAULT_DB = "/mnt/c/Users/Kaitlyn/AppData/Roaming/Pioneer/rekordbox/master.db"
 
 
+def parse_query(query: str):
+    """Split a user query into (artist, title, search_str).
+
+    "<title> by <artist>" → artist/title split on the last ' by ' (case-
+    insensitive). The Soulseek search string drops the ' by ' filler and leads
+    with the artist ("<artist> <title>"), which is what peers name folders by —
+    the raw 'by' form returns almost nothing. No ' by ' → title is the whole
+    query, artist unknown, search string unchanged.
+    """
+    parts = re.split(r"\s+by\s+", query.strip(), flags=re.IGNORECASE)
+    if len(parts) >= 2:
+        title = " by ".join(parts[:-1]).strip()
+        artist = parts[-1].strip()
+        search_str = f"{artist} {title}".strip()
+    else:
+        title, artist, search_str = query.strip(), "", query.strip()
+    return artist, title, search_str
+
+
 def _emit(payload: dict, as_json: bool):
     if as_json:
         print(json.dumps(payload, indent=2))
@@ -46,8 +66,9 @@ def _emit(payload: dict, as_json: bool):
 
 def run_add(args) -> int:
     # 1. Source
+    q_artist, q_title, search_str = parse_query(args.query)
     client = SlskdClient()
-    files = client.search(args.query)
+    files = client.search(search_str)
     candidates = rank_candidates(files, fmt=args.format)
     if not candidates:
         _emit({"status": "no_source",
@@ -79,8 +100,8 @@ def run_add(args) -> int:
 
     # 3. Identify
     tags = read_tags(src)
-    artist = tags["artist"] or args.query.split(" by ")[-1].strip()
-    title = tags["title"] or args.query.split(" by ")[0].strip()
+    artist = tags["artist"] or q_artist or q_title
+    title = tags["title"] or q_title
     dclient = DiscogsClient(os.environ.get("DISCOGS_TOKEN", ""))
     meta, conf = identify(dclient, artist, title, discogs_id=args.discogs_id)
     if meta is None:
