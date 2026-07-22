@@ -1167,6 +1167,11 @@ def run_pipeline(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Subcommand dispatch: `trackstage add "<query>" ...`
+    if len(sys.argv) > 1 and sys.argv[1] == "add":
+        from .add import main as add_main
+        sys.exit(add_main(sys.argv[2:]))
+
     inbox_default   = os.environ.get("INBOX_PATH", "")
     library_default = os.environ.get("LIBRARY_PATH", "")
     xml_default     = os.environ.get("XML_PATH", "")
