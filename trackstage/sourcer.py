@@ -34,6 +34,21 @@ def _ext(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 
+def _find_downloaded(inbox: Path, name: str) -> Path | None:
+    """Locate a completed download by basename anywhere under the inbox.
+
+    slskd nests downloads under the sender's remote folder structure, so the
+    file is rarely at the flat inbox root. Matches on exact basename (not a
+    glob — track names contain [] () & which are glob metacharacters).
+    """
+    if not inbox.exists():
+        return None
+    for p in inbox.rglob("*"):
+        if p.name == name and p.is_file():
+            return p
+    return None
+
+
 def rank_candidates(files: list[dict], fmt: str) -> list[Candidate]:
     """Filter by format policy and sort best-first.
 
@@ -130,10 +145,13 @@ class SlskdClient:
         if not wait:
             return inbox / target_name
 
+        # slskd preserves the remote folder structure, so the completed file
+        # lands at inbox/<remote dirs...>/<name>, NOT flat inbox/<name>. Search
+        # recursively for the basename rather than polling a fixed flat path.
         deadline = time.time() + timeout
-        dest = inbox / target_name
         while time.time() < deadline:
-            if dest.exists():
-                return dest
+            found = _find_downloaded(inbox, target_name)
+            if found is not None:
+                return found
             time.sleep(2.0)
         raise TimeoutError(f"Download did not complete: {target_name}")

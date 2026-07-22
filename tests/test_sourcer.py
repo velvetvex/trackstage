@@ -44,3 +44,31 @@ class TestRankCandidates:
     def test_non_audio_dropped(self):
         files = [_f("a", "cover.jpg", 100_000, None)]
         assert rank_candidates(files, fmt="any") == []
+
+
+from pathlib import Path
+from trackstage.sourcer import _find_downloaded
+
+
+class TestFindDownloaded:
+    def test_finds_nested_file(self, tmp_path):
+        # slskd nests under remote folder structure
+        nested = tmp_path / "Like A Song From Your Dream (LIES-206) (2024)"
+        nested.mkdir()
+        f = nested / "01 - Enchantress 1200.flac"
+        f.write_bytes(b"x")
+        assert _find_downloaded(tmp_path, "01 - Enchantress 1200.flac") == f
+
+    def test_finds_flat_file(self, tmp_path):
+        f = tmp_path / "track.flac"; f.write_bytes(b"x")
+        assert _find_downloaded(tmp_path, "track.flac") == f
+
+    def test_missing_returns_none(self, tmp_path):
+        assert _find_downloaded(tmp_path, "nope.flac") is None
+
+    def test_glob_metachars_in_name(self, tmp_path):
+        # brackets/parens must be matched literally, not as glob patterns
+        f = tmp_path / "sub" / "A1 [Remix] (Dub).flac"
+        f.parent.mkdir()
+        f.write_bytes(b"x")
+        assert _find_downloaded(tmp_path, "A1 [Remix] (Dub).flac") == f
