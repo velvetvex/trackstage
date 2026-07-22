@@ -1,67 +1,73 @@
 ---
 name: trackstage
-description: Use when the user wants to add music to their DJ collection, process their DJ inbox, list inbox contents, manage Rekordbox playlists, or organize their music library
+description: Add tracks to the DJ library — source from Soulseek, tag via Discogs, analyze with Essentia, and write straight into Rekordbox. Also lists/processes the inbox. Use when the user says "add <song>".
 ---
 
-# trackstage — DJ Library Management
+# trackstage — DJ Library
 
-Manages DJ music pipeline: Discogs lookup → audio analysis (key, BPM, energy, mood, cues, loudness) → tag → rename → move to Library → update Rekordbox XML with auto-playlists.
+## Add a track (direct-to-DB)
 
-## Quick Reference
+When the user says **"add &lt;song&gt;"** (optionally "by &lt;artist&gt;"), run the
+one-shot engine and report what landed. The engine sources from Soulseek,
+identifies on Discogs, analyzes with Essentia, files into the Library, and
+writes directly into Rekordbox's master.db — no XML, no manual import.
+
+```bash
+cd ~/dev/trackstage && .venv/bin/python -m trackstage add "<query>" --json
+```
+
+Add `--yes` to auto-take the top candidate. Read the JSON `status`:
+
+| status | meaning | what you do |
+|---|---|---|
+| `ok` | track written to master.db | Report title, BPM, key, energy, dest. Tell the user it appears on next Rekordbox launch (waveform builds on first load). |
+| `choose` | multiple distinct versions | Show the `candidates` list (n, user, file, bitrate, size). Ask which. Re-run adding `--pick N`. |
+| `no_source` | no FLAC / MP3≥320 found | Tell the user; offer `--format any` to accept lower bitrate. |
+| `refused` | Rekordbox is running | Ask the user to fully quit Rekordbox, then re-run. |
+| `dry_run` | preview only | Report what would be downloaded. |
+| `error` | DB write failed | master.db was auto-restored from backup. Report the error. |
+
+### Rules
+
+- **Rekordbox must be closed** before the DB write. If `refused`, do not retry
+  until the user confirms it's quit.
+- Prefer FLAC. Only pass `--format any` when the user accepts lossy or nothing
+  ≥320 exists.
+- One track per invocation. For several, run once each.
+- Never use the rekordbox-database MCP `import_track` for this — it dupes rows
+  and skips analysis. The engine is the only ingestion path.
+
+## Batch: process the existing inbox
+
+For loose files/folders already sitting in the DJ Inbox, the batch pipeline
+tags → analyzes → moves → writes to the DB (same dbwriter backend, no XML):
 
 | Action | Command |
 |--------|---------|
-| List inbox | `trackstage --list --json` |
-| Add item | `trackstage --target "NAME" -y --json` |
-| Add + playlist | `trackstage --target "NAME" -y --playlist "NAME" --json` |
-| Add with Discogs ID | `trackstage --target "NAME" -y --discogs-id 12345 --json` |
-| Process all | `trackstage -y --json` |
-| Dry run | Add `--dry-run` to any command |
-| Rebuild playlists | `trackstage --rebuild-playlists` |
+| List inbox | `cd ~/dev/trackstage && .venv/bin/python -m trackstage --list --json` |
+| Add one item | `.venv/bin/python -m trackstage --target "NAME" -y --json` |
+| Add with Discogs ID | `.venv/bin/python -m trackstage --target "NAME" -y --discogs-id 12345 --json` |
+| Process all | `.venv/bin/python -m trackstage -y --json` |
+| Dry run | add `--dry-run` |
 
-## Workflow
+Match the user's request to inbox item names from `--list --json` (fuzzy). If
+multiple match, show them and ask; if none, say so — do not guess. Rekordbox
+must be closed for the DB write here too.
 
-1. Run `--list --json` to see inbox contents
-2. Match user's request to inbox item(s) using fuzzy name matching on the JSON output
-3. Run pipeline with `--target` for each match — always use `-y` and `--json`
-4. Parse JSON output for results
-5. Report to user: what was tagged, where it moved, which playlists it landed in
-6. After successful processing, remind: "Import updated XML in Rekordbox: File → Import → Import rekordbox XML File"
+## Audio analysis (automatic per track)
 
-## Matching User Intent
+Key (Camelot), BPM (half-time corrected for DnB/jungle), Energy (1–10),
+Danceability (1–10), Mood/Vibes, Vocal detection, Cue Points, Loudness (EBU
+R128 ReplayGain). Energy→Rating stars, mood→track Color, and Genre/Vibe/Sound/
+Situation → My Tags are written straight to master.db.
 
-- "add [name]" → search inbox item names from `--list --json` output
-- Folders usually named "Artist - Release" or "Release [Label CatNo]"
-- Files usually named "NN-track.ext" or "Artist - Title.ext"
-- If multiple matches, show them and ask user to pick
-- If zero matches, say so — do not guess
+## Auto playlists
 
-## Audio Analysis (automatic per track)
-
-Each track is analyzed for:
-- **Key** — Camelot notation (e.g. 8A, 5B) for harmonic mixing
-- **BPM** — with smart half-time correction for DnB/jungle
-- **Energy** (1–10) — calibrated acoustic intensity
-- **Danceability** (1–10) — blended rhythmic regularity + onset density
-- **Mood/Vibes** — dark, euphoric, deep, melancholic, driving
-- **Vocal** — instrumental vs. voice detection
-- **Cue Points** — Mix In/Out, Drops, Breakdowns, Sections (written to Rekordbox XML)
-- **Loudness** — EBU R128 ReplayGain tags for consistent playback
-
-## Auto Playlists
-
-Pipeline auto-creates Rekordbox playlists from Discogs metadata:
-- **Styles/{style}** — one per Discogs style (Techno, House, Acid, etc.)
+- **Styles/{style}** — one per Discogs style
 - **Labels/{label}** — one per record label
-- **Recent** — last 100 tracks added
-- Custom playlists via `--playlist` flag
 
-## Library Structure
+## Library structure
 
 ```
 Library/{Year}/{Release Title [Label CatNo]}/Artist - Title.ext
 ```
-
-## Tags Written
-
-Genre, Styles, Label, Catalog Number, Year, Album, Key (Camelot), BPM, Energy, Danceability, ReplayGain, Comment (styles + catno + vibes)
