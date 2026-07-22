@@ -248,3 +248,32 @@ class RekordboxWriter:
                 self.db.add_to_playlist(pl, content)
 
         return content_id
+
+
+# ── Guards ───────────────────────────────────────────────────────────────────
+
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def rekordbox_running() -> bool:
+    """True if rekordbox.exe is running (checked via Windows tasklist from WSL)."""
+    try:
+        r = subprocess.run(
+            ["tasklist.exe", "/FI", "IMAGENAME eq rekordbox.exe"],
+            capture_output=True, text=True, timeout=15)
+        return "rekordbox.exe" in r.stdout.lower()
+    except Exception:
+        return False
+
+
+def backup_db(db_path: Path) -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = db_path.with_suffix(db_path.suffix + f".bak-{ts}")
+    shutil.copy2(db_path, backup)
+    return backup
+
+
+def restore_db(backup_path: Path, db_path: Path) -> None:
+    shutil.copy2(backup_path, db_path)
