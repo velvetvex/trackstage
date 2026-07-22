@@ -112,7 +112,8 @@ class RekordboxWriter:
     def resolve_key_id(self, camelot: str):
         if not camelot:
             return None
-        rows = self.db.session.execute(text("SELECT ID, Name FROM djmdKey"))
+        # djmdKey stores the camelot value in ScaleName (there is no Name column).
+        rows = self.db.session.execute(text("SELECT ID, ScaleName FROM djmdKey"))
         for kid, name in rows:
             if str(name).strip().lower() == camelot.strip().lower():
                 return kid
@@ -150,7 +151,8 @@ class RekordboxWriter:
         return child
 
     def _already_in_playlist(self, playlist, content_id) -> bool:
-        for song in self.db.get_playlist_songs(playlist):
+        # pyrekordbox get_playlist_songs is keyword-only; filter by PlaylistID.
+        for song in self.db.get_playlist_songs(PlaylistID=playlist.ID):
             if str(getattr(song, "ContentID", "")) == str(content_id):
                 return True
         return False

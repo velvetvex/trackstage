@@ -17,7 +17,7 @@ class FakeSession:
         if "FROM djmdMyTag" in sql:
             return iter([(r["Name"], r["ID"]) for r in self._rows["my_tags"]])
         if "FROM djmdKey" in sql:
-            return iter([(r["ID"], r["Name"]) for r in self._rows["keys"]])
+            return iter([(r["ID"], r["ScaleName"]) for r in self._rows["keys"]])
         if "FROM djmdContent" in sql:
             return iter(self._rows.get("existing", []))
         if "FROM djmdSongMyTag" in sql:
@@ -85,7 +85,7 @@ class FakeDB:
         self.playlists[name] = r
         return r
 
-    def get_playlist_songs(self, playlist):
+    def get_playlist_songs(self, **kwargs):
         return []
 
     def add_to_playlist(self, playlist, content, track_no=None):
@@ -97,7 +97,7 @@ def _rows():
     return {
         "my_tags": [{"Name": "House", "ID": "H1"},
                     {"Name": "Driving", "ID": "D1"}],
-        "keys": [{"Name": "6A", "ID": "K6A"}],
+        "keys": [{"ScaleName": "6A", "ID": "K6A"}],
         "song_tags": [],
     }
 
