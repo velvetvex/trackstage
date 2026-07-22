@@ -3,7 +3,7 @@
 pipeline.py — trackstage core pipeline
 
 Scan inbox → Discogs lookup → audio analysis → tag → rename → move to Library →
-update Rekordbox XML with collection entries and auto-playlists.
+write directly to Rekordbox master.db with auto-playlists (Styles/Labels).
 
 Usage:
     trackstage --list                              # show inbox contents
@@ -11,15 +11,17 @@ Usage:
     trackstage -y                                  # process everything
     trackstage --target "track.flac" -y --discogs-id 12345
     trackstage --dry-run -y                        # preview without changes
+    trackstage add "E Talking by Soulwax" -y       # source + add one track
 
 Config (.env in same folder as this script):
     DISCOGS_TOKEN=yourtoken
     INBOX_PATH=/path/to/inbox
     LIBRARY_PATH=/path/to/library
-    XML_PATH=/path/to/rekordbox.xml
+    REKORDBOX_DB=/mnt/c/.../rekordbox/master.db    # optional override
 
 Requirements:
-    pip install mutagen thefuzz python-Levenshtein requests python-dotenv
+    pip install mutagen thefuzz python-Levenshtein requests python-dotenv \
+                pyrekordbox SQLAlchemy
 """
 
 import os
@@ -44,10 +46,17 @@ except ImportError:
     pass
 
 from .tags import read_tags, write_tags, build_comment, EXTENSIONS as AUDIO_EXTS_TAG
-from .xml import (
-    to_rb_location, sanitize_xml, load_or_bootstrap_xml, save_xml,
-    update_playlists, rebuild_playlists, KIND_MAP, RECENT_PLAYLIST_CAP,
+from .dbwriter import (
+    RekordboxWriter, rekordbox_running, backup_db, restore_db,
 )
+from .rekordbox import to_rb_windows_path
+
+try:
+    from pyrekordbox import Rekordbox6Database
+except ImportError:
+    Rekordbox6Database = None
+
+DEFAULT_DB = "/mnt/c/Users/Kaitlyn/AppData/Roaming/Pioneer/rekordbox/master.db"
 
 try:
     from mutagen.mp3 import MP3
@@ -385,100 +394,44 @@ def read_audio_info(fp: Path) -> dict:
 
 
 
-# ── Collection + XML update ──────────────────────────────────────────────────
+# ── Collection + Rekordbox DB write ──────────────────────────────────────────
 
-def append_tracks_to_xml(
-    xml_path: Path,
-    new_tracks: list,
-    custom_playlist: Optional[str] = None,
-    dry_run: bool = False,
-) -> list:
-    """
-    Add tracks to COLLECTION and update playlists.
-    Returns list of result dicts with track_id for reporting.
-    """
-    if not new_tracks:
-        return []
+def write_results_to_db(results: list, dry_run: bool = False) -> dict:
+    """Write each processed track directly to Rekordbox master.db via dbwriter."""
+    if dry_run or not results:
+        return {"written": 0, "skipped": 0}
 
-    tree, root, max_id = load_or_bootstrap_xml(xml_path)
-    collection = root.find("COLLECTION")
-    if collection is None:
-        collection = ET.SubElement(root, "COLLECTION", Entries="0")
+    if rekordbox_running():
+        log.error("  ✗  Rekordbox is running — close it and re-run. Nothing written.")
+        return {"written": 0, "skipped": len(results)}
 
-    existing_locs = {t.get("Location", "") for t in collection.findall("TRACK")}
-
-    added = []
-    for entry in new_tracks:
-        fp     = entry["file_path"]
-        meta   = entry["meta"]
-        artist = sanitize_xml(entry.get("artist", ""))
-        title  = sanitize_xml(entry.get("title", ""))
-
-        loc = to_rb_location(fp)
-        if loc in existing_locs:
-            log.info(f"  — XML: already indexed, skipping: {fp.name}")
-            continue
-
-        max_id += 1
-        ainfo   = read_audio_info(fp) if fp.exists() else {
-            "total_time": "0", "bitrate": "0", "samplerate": "0"
-        }
-        comment = sanitize_xml(build_comment(meta))
-
-        attrs = {
-            "TrackID":     str(max_id),
-            "Name":        title,
-            "Artist":      artist,
-            "Composer":    "",
-            "Album":       sanitize_xml(meta.get("album", "")),
-            "Grouping":    sanitize_xml(meta.get("vibes", "")),
-            "Genre":       sanitize_xml(meta.get("genre", "")),
-            "Kind":        KIND_MAP.get(fp.suffix.lower(), "Unknown"),
-            "Size":        str(fp.stat().st_size) if fp.exists() else "0",
-            "TotalTime":   ainfo["total_time"],
-            "DiscNumber":  "0",
-            "TrackNumber": "0",
-            "Year":        sanitize_xml(meta.get("year", "")),
-            "AverageBpm":  meta.get("bpm", "0.00"),
-            "DateAdded":   str(date.today()),
-            "BitRate":     ainfo["bitrate"],
-            "SampleRate":  ainfo["samplerate"],
-            "Comments":    comment,
-            "PlayCount":   "0",
-            "Rating":      "0",
-            "Location":    loc,
-            "Remixer":     "",
-            "Tonality":    sanitize_xml(meta.get("initial_key", "")),
-            "Label":       sanitize_xml(meta.get("label", "")),
-            "Mix":         "",
-        }
-
-        if not dry_run:
-            track_el = ET.SubElement(collection, "TRACK", **attrs)
-            for cue in meta.get("_cues", []):
-                cue_colors = CUE_COLORS.get(cue["type"], {}) if _CUE_DETECTION else {}
-                cue_attrs = {
-                    "Name": cue["name"],
-                    "Type": "0",
-                    "Start": str(cue["time"]),
-                    "Num": "-1",
-                }
-                cue_attrs.update(cue_colors)
-                ET.SubElement(track_el, "POSITION_MARK", **cue_attrs)
-        added.append({"track_id": str(max_id), "meta": meta,
-                       "artist": artist, "title": title})
-        existing_locs.add(loc)
-
-    if not dry_run and added:
-        current = int(collection.get("Entries", "0"))
-        collection.set("Entries", str(current + len(added)))
-        update_playlists(root, added, custom_playlist, dry_run)
-        save_xml(tree, xml_path)
-
-    verb = "[DRY RUN] Would add" if dry_run else "✓  Added"
-    log.info(f"  {verb} {len(added)} track(s) to XML → {xml_path}")
-
-    return added
+    db_path = Path(os.environ.get("REKORDBOX_DB", DEFAULT_DB))
+    backup = backup_db(db_path)
+    db = Rekordbox6Database(path=str(db_path))
+    written = 0
+    try:
+        writer = RekordboxWriter(db)
+        for r in results:
+            fp = r["file_path"]
+            meta = r["meta"]
+            analysis = {
+                "bpm": meta.get("bpm", ""), "camelot": meta.get("initial_key", ""),
+                "energy": meta.get("energy", ""),
+                "danceability": meta.get("danceability", ""),
+                "vibes": [v.strip() for v in meta.get("vibes", "").split(",") if v.strip()],
+                "vocal": meta.get("vocal", ""), "moods": meta.get("_moods", []),
+            }
+            writer.add_track(
+                wsl_path=str(fp), win_path=to_rb_windows_path(fp),
+                filename=fp.name, title=r["title"], artist=r["artist"],
+                meta=meta, analysis=analysis)
+            written += 1
+        db.commit()
+    except Exception as e:
+        restore_db(backup, db_path)
+        log.error(f"  ✗  DB write failed: {e}. master.db restored from backup.")
+        return {"written": 0, "skipped": len(results)}
+    return {"written": written, "skipped": 0}
 
 
 # ── Inbox discovery ───────────────────────────────────────────────────────────
@@ -987,8 +940,8 @@ def process_release_folder(folder, client, library, threshold, dry_run,
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
 def run_pipeline(
-    inbox, library, xml_path, token, threshold, dry_run, target,
-    auto_approve, discogs_id, custom_playlist, as_json,
+    inbox, library, token, threshold, dry_run, target,
+    auto_approve, discogs_id, as_json,
 ):
     client = DiscogsClient(token)
 
@@ -998,14 +951,11 @@ def run_pipeline(
         print(f"{'═' * 64}")
         print(f"  Inbox:     {inbox}")
         print(f"  Library:   {library}")
-        print(f"  XML:       {xml_path}")
         print(f"  Threshold: ≥{threshold}%")
         if auto_approve:
             print(f"  Mode:      AUTO-APPROVE")
         if dry_run:
             print(f"  *** DRY RUN ***")
-        if custom_playlist:
-            print(f"  Playlist:  {custom_playlist}")
         print(f"  Verifying Discogs token...", end=" ", flush=True)
 
     if not client.verify():
@@ -1102,17 +1052,16 @@ def run_pipeline(
                                          dry_run, discogs_id)
         all_results.extend(results)
 
-    # Update XML
+    # Write to Rekordbox DB
     if not as_json:
-        print(f"\n  ── Rekordbox XML {'─' * 46}")
+        print(f"\n  ── Rekordbox database {'─' * 41}")
 
     if all_results:
-        added = append_tracks_to_xml(xml_path, all_results, custom_playlist,
-                                     dry_run)
+        db_result = write_results_to_db(all_results, dry_run)
     else:
-        added = []
+        db_result = {"written": 0, "skipped": 0}
         if not as_json:
-            print("  — No tracks processed — XML unchanged.")
+            print("  — No tracks processed — database unchanged.")
 
     processed = len(all_results)
 
@@ -1129,28 +1078,16 @@ def run_pipeline(
                 "year":    r["meta"].get("year", ""),
             })
 
-        playlists_added = set()
-        for a in added:
-            meta = a["meta"]
-            for s in meta.get("styles", "").split(", "):
-                if s.strip():
-                    playlists_added.add(f"Styles/{s.strip()}")
-            if meta.get("label", "").strip():
-                playlists_added.add(f"Labels/{meta['label'].strip()}")
-            playlists_added.add("Recent")
-            if custom_playlist:
-                playlists_added.add(custom_playlist)
-
         print(json.dumps({
-            "processed": processed,
-            "dry_run":   dry_run,
-            "results":   json_results,
-            "playlists": sorted(playlists_added),
-            "xml_path":  str(xml_path),
+            "processed":  processed,
+            "dry_run":    dry_run,
+            "results":    json_results,
+            "db_written": db_result["written"],
         }, indent=2))
     else:
         print(f"\n{'═' * 64}")
         print(f"  ✓  Processed & moved : {processed}")
+        print(f"  ✓  Written to DB     : {db_result['written']}")
         print(f"  —  Left in inbox     : {total - processed}")
         print(f"  —  Silently skipped  : {len(skipped)}")
         print(f"{'═' * 64}\n")
@@ -1158,10 +1095,7 @@ def run_pipeline(
         if dry_run:
             print("  Re-run without --dry-run to apply changes.\n")
         elif processed:
-            print(
-                "  In Rekordbox 7: File → Import → Import rekordbox XML File\n"
-                f"  Select: {xml_path}\n"
-            )
+            print("  Tracks written directly to Rekordbox — launch Rekordbox to see them.\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1174,31 +1108,23 @@ def main():
 
     inbox_default   = os.environ.get("INBOX_PATH", "")
     library_default = os.environ.get("LIBRARY_PATH", "")
-    xml_default     = os.environ.get("XML_PATH", "")
 
     p = argparse.ArgumentParser(
-        description="trackstage: Discogs → Tag → Move → Rekordbox XML + Playlists",
+        description="trackstage: Discogs → Tag → Analyze → Move → Rekordbox DB + Playlists",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--list", action="store_true",
                    help="List inbox contents and exit")
-    p.add_argument("--rebuild-playlists", action="store_true",
-                   help="Rebuild all playlists from existing XML tracks and exit")
     p.add_argument("--target", type=Path, default=None,
                    help="Process only this file or folder (relative to inbox)")
     p.add_argument("--discogs-id", type=int, default=None,
                    help="Use this Discogs release ID instead of searching")
-    p.add_argument("--playlist", type=str, default=None,
-                   help="Also add tracks to this custom Rekordbox playlist")
     p.add_argument("--inbox", type=Path,
                    default=Path(inbox_default) if inbox_default else None,
                    help="DJ Inbox folder")
     p.add_argument("--library", type=Path,
                    default=Path(library_default) if library_default else None,
                    help="Library root folder")
-    p.add_argument("--xml", type=Path,
-                   default=Path(xml_default) if xml_default else None,
-                   help="Rekordbox XML path")
     p.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD,
                    help=f"Discogs match confidence to auto-approve (default: {DEFAULT_THRESHOLD})")
     p.add_argument("--dry-run", action="store_true",
@@ -1220,16 +1146,8 @@ def main():
             print(f"ERROR: {label} folder not found: {val}")
             sys.exit(1)
 
-    if args.xml is None:
-        print("ERROR: XML path not configured. Set XML_PATH in .env or pass --xml.")
-        sys.exit(1)
-
     if args.list:
         list_inbox(args.inbox, args.json)
-        return
-
-    if args.rebuild_playlists:
-        rebuild_playlists(args.xml, args.json)
         return
 
     token = os.environ.get("DISCOGS_TOKEN", "").strip()
@@ -1240,14 +1158,12 @@ def main():
     run_pipeline(
         inbox=args.inbox,
         library=args.library,
-        xml_path=args.xml,
         token=token,
         threshold=args.threshold,
         dry_run=args.dry_run,
         target=args.target,
         auto_approve=args.auto_approve,
         discogs_id=args.discogs_id,
-        custom_playlist=args.playlist,
         as_json=args.json,
     )
 

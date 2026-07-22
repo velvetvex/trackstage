@@ -11,19 +11,11 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
-try:
-    from trackstage.xml import to_rb_location as _unused  # noqa: F401 — verify module exists
-
-    def to_rb_windows_path(path):
-        """Convert WSL path to Rekordbox Windows path (C:/...)."""
-        posix = path.as_posix()
-        m = re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
-        return f"{m.group(1).upper()}:/{m.group(2)}" if m else posix
-except ImportError:
-    def to_rb_windows_path(path):
-        posix = path.as_posix()
-        m = re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
-        return f"{m.group(1).upper()}:/{m.group(2)}" if m else posix
+def to_rb_windows_path(path):
+    """Convert WSL path to Rekordbox Windows path (C:/...)."""
+    posix = path.as_posix()
+    m = re.match(r"/mnt/([a-zA-Z])/(.*)", posix)
+    return f"{m.group(1).upper()}:/{m.group(2)}" if m else posix
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
